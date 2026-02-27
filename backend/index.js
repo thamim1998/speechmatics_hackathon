@@ -12,7 +12,7 @@ import {
   addMessage,
   destroySession,
 } from './session.js';
-import { generateResponse, GREETING } from './counsellor.js';
+import { generateResponse, generateResponseStreaming, GREETING } from './counsellor.js';
 import {
   createSTTClient,
   connectSTT,
@@ -163,10 +163,23 @@ wss.on('connection', (ws) => {
 
         // Initialize STT with callbacks
         session.mediaChunkCount = 0;
+        let utteranceTimer = null;
+        const UTTERANCE_SILENCE_MS = 700; // 0.7s of silence after last final → trigger response
+
         session.sttClient = createSTTClient({
           onPartial: (text) => {
-            console.log(`[stt] Partial: "${text}"`);
-            session.currentUtterance = text;
+            // Track partial separately — never overwrite confirmed finals
+            session.partialUtterance = text;
+            // Reset silence timer while user is still speaking
+            if (utteranceTimer) clearTimeout(utteranceTimer);
+            utteranceTimer = setTimeout(() => {
+              // Use finals + any trailing partial
+              const fullText = (session.currentUtterance + ' ' + (session.partialUtterance || '')).trim();
+              session.currentUtterance = fullText;
+              session.partialUtterance = '';
+              console.log(`[stt] Silence timeout — triggering response (utterance: "${fullText}")`);
+              handleEndOfUtterance(callSid, ws);
+            }, UTTERANCE_SILENCE_MS);
           },
           onFinal: (text) => {
             console.log(`[stt] Final: "${text}"`);
@@ -174,9 +187,21 @@ wss.on('connection', (ws) => {
               session.currentUtterance +=
                 (session.currentUtterance ? ' ' : '') + text;
             }
+            session.partialUtterance = ''; // partial was promoted to final
+            // Reset silence timer — user is still speaking
+            if (utteranceTimer) clearTimeout(utteranceTimer);
+            utteranceTimer = setTimeout(() => {
+              console.log(`[stt] Silence timeout — triggering response (utterance: "${session.currentUtterance}")`);
+              handleEndOfUtterance(callSid, ws);
+            }, UTTERANCE_SILENCE_MS);
           },
           onEndOfUtterance: () => {
-            console.log(`[stt] EndOfUtterance — currentUtterance: "${session.currentUtterance}", isProcessing: ${session.isProcessing}`);
+            // Also trigger on native EndOfUtterance if it fires
+            const fullText = (session.currentUtterance + ' ' + (session.partialUtterance || '')).trim();
+            session.currentUtterance = fullText;
+            session.partialUtterance = '';
+            console.log(`[stt] EndOfUtterance — utterance: "${fullText}", isProcessing: ${session.isProcessing}`);
+            if (utteranceTimer) clearTimeout(utteranceTimer);
             handleEndOfUtterance(callSid, ws);
           },
         });
@@ -270,16 +295,67 @@ async function handleEndOfUtterance(callSid, ws) {
   try { ws.send(JSON.stringify({ event: 'transcript', transcript: { speaker: 'user', text: userText } })); } catch {};
 
   try {
-    // Generate counsellor response via Claude
-    const responseText = await generateResponse(session.messages);
+    // Stream Claude's response and TTS sentence-by-sentence for low latency.
+    // Each sentence is synthesized and sent as soon as it's complete,
+    // while Claude continues generating the rest.
+    let buffer = '';
+    const ttsQueue = [];
+    let ttsRunning = false;
+
+    const processTtsQueue = async () => {
+      if (ttsRunning) return;
+      ttsRunning = true;
+      while (ttsQueue.length > 0) {
+        const sentence = ttsQueue.shift();
+        try {
+          const pcmAudio = await synthesizeSpeech(sentence);
+          const mulawAudio = pcm16kToMulaw8k(pcmAudio);
+          sendAudioToTwilio(ws, session.streamSid, mulawAudio);
+        } catch (err) {
+          console.error('[pipeline] Sentence TTS failed:', err.message);
+        }
+      }
+      ttsRunning = false;
+    };
+
+    const enqueueSentence = (sentence) => {
+      const trimmed = sentence.trim();
+      if (!trimmed) return;
+      console.log(`[pipeline] TTS sentence: "${trimmed}"`);
+      ttsQueue.push(trimmed);
+      processTtsQueue();
+    };
+
+    const responseText = await generateResponseStreaming(session.messages, (chunk) => {
+      buffer += chunk;
+      // Split on sentence boundaries: . ! ? followed by space or end
+      const match = buffer.match(/^(.*?[.!?])\s+(.*)$/s);
+      if (match) {
+        enqueueSentence(match[1]);
+        buffer = match[2];
+      }
+    });
+
+    // Flush remaining text
+    if (buffer.trim()) {
+      enqueueSentence(buffer);
+    }
+
+    // Wait for all TTS to finish
+    while (ttsQueue.length > 0 || ttsRunning) {
+      await new Promise((r) => setTimeout(r, 100));
+    }
+
     console.log(`[pipeline] Counsellor: "${responseText}"`);
     addMessage(callSid, 'assistant', responseText);
     try { ws.send(JSON.stringify({ event: 'transcript', transcript: { speaker: 'assistant', text: responseText } })); } catch {};
 
-    // Synthesize speech and send to Twilio
-    const pcmAudio = await synthesizeSpeech(responseText);
-    const mulawAudio = pcm16kToMulaw8k(pcmAudio);
-    sendAudioToTwilio(ws, session.streamSid, mulawAudio);
+    // Send mark after all audio
+    ws.send(JSON.stringify({
+      event: 'mark',
+      streamSid: session.streamSid,
+      mark: { name: `speech_${Date.now()}` },
+    }));
   } catch (err) {
     console.error('[pipeline] Response pipeline failed:', err.message);
   } finally {

@@ -2,14 +2,14 @@ import Anthropic from '@anthropic-ai/sdk';
 
 const client = new Anthropic({ apiKey: process.env.CLAUDE_API_KEY });
 
-const SYSTEM_PROMPT = `You are a compassionate, empathetic mental health counsellor speaking on the phone. Your role is to listen actively, validate feelings, and provide supportive guidance.
+const SYSTEM_PROMPT = `You are a compassionate, empathetic mental health counsellor speaking on a live phone call. Your role is to listen actively, validate feelings, and provide supportive guidance.
 
 Guidelines:
-- Keep responses to 2-4 short sentences — you are speaking aloud on a phone call, not writing an essay.
+- Keep responses to 1-2 short sentences — this is a live phone call, be concise and natural.
 - Use warm, natural conversational language. Avoid clinical jargon.
 - Acknowledge what the caller said before responding.
-- Ask open-ended questions to encourage the caller to share more.
-- If the caller expresses suicidal thoughts, self-harm, or immediate danger to themselves or others, calmly direct them to call 911 or their local emergency number immediately.
+- Ask one open-ended question to encourage the caller to share more.
+- If the caller expresses suicidal thoughts, self-harm, or immediate danger, calmly direct them to call 911 or their local emergency number immediately.
 - Never diagnose conditions or prescribe medication.
 - Do not repeat the same question or phrase verbatim.`;
 
@@ -19,8 +19,8 @@ export { GREETING };
 
 export async function generateResponse(conversationHistory) {
   const response = await client.messages.create({
-    model: 'claude-sonnet-4-6-20250514',
-    max_tokens: 300,
+    model: 'claude-haiku-4-5',
+    max_tokens: 150,
     system: SYSTEM_PROMPT,
     messages: conversationHistory,
   });
@@ -30,8 +30,8 @@ export async function generateResponse(conversationHistory) {
 
 export async function generateResponseStreaming(conversationHistory, onChunk) {
   const stream = client.messages.stream({
-    model: 'claude-sonnet-4-6-20250514',
-    max_tokens: 300,
+    model: 'claude-haiku-4-5',
+    max_tokens: 150,
     system: SYSTEM_PROMPT,
     messages: conversationHistory,
   });

@@ -26,6 +26,7 @@ export function createSession(callSid, metadata = {}) {
     sttClient: null,
     isProcessing: false,
     currentUtterance: '',
+    partialUtterance: '',
     metadata,             // relationship, questions, contactName, etc.
     createdAt: new Date(),
   };
