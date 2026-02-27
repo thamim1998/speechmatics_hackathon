@@ -1,0 +1,419 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Voice AI — Browser Test Harness</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0f1117; color: #e1e4e8; min-height: 100vh; padding: 24px; }
+  h1 { font-size: 1.4rem; margin-bottom: 16px; color: #58a6ff; }
+
+  .panel { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 16px; margin-bottom: 16px; }
+  .panel h2 { font-size: 0.85rem; text-transform: uppercase; letter-spacing: 0.05em; color: #8b949e; margin-bottom: 12px; }
+
+  label { display: block; font-size: 0.82rem; color: #8b949e; margin-bottom: 4px; }
+  input, textarea { width: 100%; padding: 8px 10px; background: #0d1117; border: 1px solid #30363d; border-radius: 4px; color: #e1e4e8; font-size: 0.9rem; margin-bottom: 10px; }
+  input:focus, textarea:focus { outline: none; border-color: #58a6ff; }
+  textarea { resize: vertical; min-height: 60px; }
+
+  .row { display: flex; gap: 12px; }
+  .row > * { flex: 1; }
+
+  .controls { display: flex; gap: 12px; align-items: center; }
+  button { padding: 10px 24px; border: none; border-radius: 6px; font-size: 0.9rem; font-weight: 600; cursor: pointer; transition: opacity 0.15s; }
+  button:disabled { opacity: 0.4; cursor: not-allowed; }
+  #btnStart { background: #238636; color: #fff; }
+  #btnStart:hover:not(:disabled) { background: #2ea043; }
+  #btnStop { background: #da3633; color: #fff; }
+  #btnStop:hover:not(:disabled) { background: #f85149; }
+
+  .status-bar { display: flex; align-items: center; gap: 12px; font-size: 0.85rem; }
+  .status-dot { width: 10px; height: 10px; border-radius: 50%; background: #484f58; flex-shrink: 0; }
+  .status-dot.connected { background: #3fb950; }
+  .status-dot.error { background: #f85149; }
+  #statusText { color: #8b949e; }
+  #callTimer { color: #8b949e; margin-left: auto; font-variant-numeric: tabular-nums; }
+
+  .transcript { max-height: 350px; overflow-y: auto; }
+  .transcript-entry { padding: 8px 0; border-bottom: 1px solid #21262d; }
+  .transcript-entry:last-child { border-bottom: none; }
+  .transcript-entry .speaker { font-size: 0.75rem; font-weight: 600; text-transform: uppercase; margin-bottom: 2px; }
+  .transcript-entry .speaker.user { color: #58a6ff; }
+  .transcript-entry .speaker.assistant { color: #3fb950; }
+  .transcript-entry .text { font-size: 0.9rem; line-height: 1.5; }
+
+  .debug-log { max-height: 200px; overflow-y: auto; font-family: 'SF Mono', 'Fira Code', monospace; font-size: 0.75rem; line-height: 1.6; color: #8b949e; }
+  .debug-log .entry { white-space: pre-wrap; word-break: break-all; }
+  .debug-log .entry.error { color: #f85149; }
+  .debug-log .entry.info { color: #58a6ff; }
+
+  .empty-state { color: #484f58; font-style: italic; font-size: 0.85rem; padding: 20px 0; text-align: center; }
+</style>
+</head>
+<body>
+
+<h1>Voice AI — Browser Test Harness</h1>
+
+<div class="panel">
+  <h2>Connection</h2>
+  <label for="wsUrl">WebSocket URL</label>
+  <input type="text" id="wsUrl" value="ws://localhost:3000/media-stream">
+</div>
+
+<div class="panel">
+  <h2>Session Config</h2>
+  <div class="row">
+    <div>
+      <label for="contactName">Contact Name</label>
+      <input type="text" id="contactName" placeholder="e.g. Sarah">
+    </div>
+    <div>
+      <label for="relationship">Relationship</label>
+      <input type="text" id="relationship" placeholder="e.g. friend, partner">
+    </div>
+  </div>
+  <label for="questions">Questions (one per line)</label>
+  <textarea id="questions" placeholder="How are you feeling today?&#10;What's been on your mind?"></textarea>
+</div>
+
+<div class="panel">
+  <div class="controls">
+    <button id="btnStart">Start Call</button>
+    <button id="btnStop" disabled>Stop Call</button>
+    <div class="status-bar">
+      <div class="status-dot" id="statusDot"></div>
+      <span id="statusText">Disconnected</span>
+      <span id="callTimer"></span>
+    </div>
+  </div>
+</div>
+
+<div class="panel">
+  <h2>Transcript</h2>
+  <div class="transcript" id="transcript">
+    <div class="empty-state">Start a call to see the transcript</div>
+  </div>
+</div>
+
+<div class="panel">
+  <h2>Debug Log</h2>
+  <div class="debug-log" id="debugLog"></div>
+</div>
+
+<script>
+// ─── Mulaw Decode Table (matches alawmulaw npm package) ──────
+const MULAW_SEGMENT = [0, 132, 396, 924, 1980, 4092, 8316, 16764];
+const MULAW_DECODE = new Int16Array(256);
+(function buildTable() {
+  for (let i = 0; i < 256; i++) {
+    const v = ~i & 0xFF;
+    const sign = v & 0x80;
+    const exponent = (v >> 4) & 0x07;
+    const mantissa = v & 0x0F;
+    const sample = MULAW_SEGMENT[exponent] + (mantissa << (exponent + 3));
+    MULAW_DECODE[i] = sign ? -sample : sample;
+  }
+})();
+
+// ─── Base64 Utilities ────────────────────────────────────────
+function uint8ToBase64(bytes) {
+  let binary = '';
+  for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+  return btoa(binary);
+}
+function base64ToUint8(b64) {
+  const binary = atob(b64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes;
+}
+
+// ─── State ───────────────────────────────────────────────────
+let ws = null;
+let audioContext = null;
+let micStream = null;
+let workletNode = null;
+let player = null;
+let callSid = null;
+let streamSid = null;
+let timerInterval = null;
+let callStartTime = null;
+let chunksSent = 0;
+let chunksReceived = 0;
+let micGateOpen = false; // Don't send mic audio until greeting finishes
+
+// ─── DOM Refs ────────────────────────────────────────────────
+const btnStart = document.getElementById('btnStart');
+const btnStop = document.getElementById('btnStop');
+const statusDot = document.getElementById('statusDot');
+const statusText = document.getElementById('statusText');
+const callTimer = document.getElementById('callTimer');
+const transcriptEl = document.getElementById('transcript');
+const debugLogEl = document.getElementById('debugLog');
+
+// ─── Debug Log ───────────────────────────────────────────────
+function log(msg, level = '') {
+  const entry = document.createElement('div');
+  entry.className = 'entry' + (level ? ' ' + level : '');
+  const ts = new Date().toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
+  entry.textContent = `[${ts}] ${msg}`;
+  debugLogEl.appendChild(entry);
+  debugLogEl.scrollTop = debugLogEl.scrollHeight;
+}
+
+// ─── Status ──────────────────────────────────────────────────
+function setStatus(text, state) {
+  statusText.textContent = text;
+  statusDot.className = 'status-dot' + (state ? ' ' + state : '');
+}
+
+function startTimer() {
+  callStartTime = Date.now();
+  timerInterval = setInterval(() => {
+    const elapsed = Math.floor((Date.now() - callStartTime) / 1000);
+    const m = String(Math.floor(elapsed / 60)).padStart(2, '0');
+    const s = String(elapsed % 60).padStart(2, '0');
+    callTimer.textContent = `${m}:${s}`;
+  }, 1000);
+}
+function stopTimer() {
+  clearInterval(timerInterval);
+  timerInterval = null;
+  callTimer.textContent = '';
+}
+
+// ─── Transcript ──────────────────────────────────────────────
+function addTranscript(speaker, text) {
+  // Remove empty state
+  const empty = transcriptEl.querySelector('.empty-state');
+  if (empty) empty.remove();
+
+  const entry = document.createElement('div');
+  entry.className = 'transcript-entry';
+  entry.innerHTML = `<div class="speaker ${speaker}">${speaker === 'user' ? 'You' : 'AI Counsellor'}</div><div class="text">${escapeHtml(text)}</div>`;
+  transcriptEl.appendChild(entry);
+  transcriptEl.scrollTop = transcriptEl.scrollHeight;
+}
+function escapeHtml(s) {
+  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+// ─── Audio Player ────────────────────────────────────────────
+class AudioPlayer {
+  constructor(ctx) {
+    this.ctx = ctx;
+    this.gainNode = ctx.createGain();
+    this.gainNode.connect(ctx.destination);
+    this.nextStartTime = 0;
+  }
+
+  play(mulawBytes) {
+    const len = mulawBytes.length;
+    const buffer = this.ctx.createBuffer(1, len, 8000);
+    const channelData = buffer.getChannelData(0);
+    for (let i = 0; i < len; i++) {
+      channelData[i] = MULAW_DECODE[mulawBytes[i]] / 32768;
+    }
+
+    const source = this.ctx.createBufferSource();
+    source.buffer = buffer;
+    source.connect(this.gainNode);
+
+    const now = this.ctx.currentTime;
+    const startAt = Math.max(now, this.nextStartTime);
+    source.start(startAt);
+    this.nextStartTime = startAt + buffer.duration;
+  }
+
+  stop() {
+    // Disconnect gain node to silence all queued sources instantly
+    this.gainNode.disconnect();
+    this.gainNode = this.ctx.createGain();
+    this.gainNode.connect(this.ctx.destination);
+    this.nextStartTime = 0;
+  }
+}
+
+// ─── Start Call ──────────────────────────────────────────────
+btnStart.addEventListener('click', async () => {
+  btnStart.disabled = true;
+  btnStop.disabled = false;
+  chunksSent = 0;
+  chunksReceived = 0;
+
+  try {
+    // Create AudioContext inside click handler (autoplay policy)
+    audioContext = new AudioContext();
+    player = new AudioPlayer(audioContext);
+
+    // Get mic with echo cancellation
+    micStream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }
+    });
+    log('Mic acquired (sample rate: ' + audioContext.sampleRate + 'Hz)', 'info');
+
+    // Set up AudioWorklet
+    await audioContext.audioWorklet.addModule('audio-processor.js');
+    const micSource = audioContext.createMediaStreamSource(micStream);
+    workletNode = new AudioWorkletNode(audioContext, 'mulaw-processor');
+
+    workletNode.port.onmessage = (e) => {
+      if (ws && ws.readyState === WebSocket.OPEN && streamSid && micGateOpen) {
+        const payload = uint8ToBase64(e.data);
+        ws.send(JSON.stringify({
+          event: 'media',
+          streamSid: streamSid,
+          media: { payload }
+        }));
+        chunksSent++;
+        if (chunksSent % 250 === 0) log(`Sent ${chunksSent} audio chunks (~${(chunksSent * 20 / 1000).toFixed(0)}s)`);
+      }
+    };
+    micSource.connect(workletNode);
+    workletNode.connect(audioContext.destination); // required for worklet to process, output is silent
+
+    // Connect WebSocket
+    const wsUrl = document.getElementById('wsUrl').value;
+    setStatus('Connecting…', '');
+    log('Connecting to ' + wsUrl, 'info');
+
+    ws = new WebSocket(wsUrl);
+
+    ws.onopen = () => {
+      log('WebSocket connected', 'info');
+      setStatus('Connected — starting stream…', 'connected');
+
+      // Send Twilio-compatible 'connected' event
+      ws.send(JSON.stringify({ event: 'connected', protocol: 'Call', version: '1.0.0' }));
+
+      // Send 'start' event with session config
+      callSid = 'TEST-' + Date.now();
+      streamSid = 'STREAM-' + Date.now();
+      const questions = document.getElementById('questions').value
+        .split('\n').map(q => q.trim()).filter(Boolean).join('|');
+
+      ws.send(JSON.stringify({
+        event: 'start',
+        sequenceNumber: '1',
+        start: {
+          accountSid: 'TEST',
+          streamSid: streamSid,
+          callSid: callSid,
+          tracks: ['inbound'],
+          mediaFormat: {
+            encoding: 'audio/x-mulaw',
+            sampleRate: 8000,
+            channels: 1
+          },
+          customParameters: {
+            contactName: document.getElementById('contactName').value,
+            relationship: document.getElementById('relationship').value,
+            questions: questions
+          }
+        }
+      }));
+
+      log(`Stream started — callSid: ${callSid}`, 'info');
+      setStatus('In call — waiting for greeting…', 'connected');
+      startTimer();
+
+      // Fallback: open mic gate after 6s even if mark never arrives
+      setTimeout(() => {
+        if (!micGateOpen) {
+          micGateOpen = true;
+          log('Mic gate open (fallback timeout)', 'info');
+          setStatus('In call', 'connected');
+        }
+      }, 6000);
+    };
+
+    ws.onmessage = (e) => {
+      let msg;
+      try { msg = JSON.parse(e.data); } catch { return; }
+
+      switch (msg.event) {
+        case 'media':
+          if (msg.media && msg.media.payload) {
+            const mulawBytes = base64ToUint8(msg.media.payload);
+            player.play(mulawBytes);
+            chunksReceived++;
+            if (chunksReceived % 50 === 0) log(`Received ${chunksReceived} audio chunks`);
+          }
+          break;
+
+        case 'mark':
+          log(`Mark: ${msg.mark?.name || 'unnamed'}`);
+          if (!micGateOpen) {
+            // Greeting audio fully sent — wait 1s for playback buffer to drain, then open mic
+            setTimeout(() => {
+              micGateOpen = true;
+              log('Mic gate open — now sending audio to server', 'info');
+              setStatus('In call', 'connected');
+            }, 1000);
+          }
+          break;
+
+        case 'transcript':
+          if (msg.transcript) {
+            addTranscript(msg.transcript.speaker, msg.transcript.text);
+            log(`Transcript [${msg.transcript.speaker}]: ${msg.transcript.text.substring(0, 80)}…`);
+          }
+          break;
+
+        default:
+          log(`Event: ${msg.event}`);
+      }
+    };
+
+    ws.onerror = (e) => {
+      log('WebSocket error', 'error');
+      setStatus('Error', 'error');
+    };
+
+    ws.onclose = () => {
+      log('WebSocket closed', 'info');
+      setStatus('Disconnected', '');
+      cleanup();
+    };
+
+  } catch (err) {
+    log('Start failed: ' + err.message, 'error');
+    setStatus('Error: ' + err.message, 'error');
+    cleanup();
+  }
+});
+
+// ─── Stop Call ───────────────────────────────────────────────
+btnStop.addEventListener('click', () => {
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    // Send Twilio-compatible 'stop' event
+    ws.send(JSON.stringify({
+      event: 'stop',
+      sequenceNumber: '999',
+      stop: { accountSid: 'TEST', callSid: callSid }
+    }));
+    log('Sent stop event', 'info');
+    ws.close();
+  }
+  cleanup();
+});
+
+// ─── Cleanup ─────────────────────────────────────────────────
+function cleanup() {
+  if (workletNode) { workletNode.disconnect(); workletNode = null; }
+  if (micStream) { micStream.getTracks().forEach(t => t.stop()); micStream = null; }
+  if (player) { player.stop(); player = null; }
+  if (audioContext) { audioContext.close(); audioContext = null; }
+  stopTimer();
+  ws = null;
+  callSid = null;
+  streamSid = null;
+  micGateOpen = false;
+  btnStart.disabled = false;
+  btnStop.disabled = true;
+  log(`Session ended — sent ${chunksSent} chunks, received ${chunksReceived} chunks`, 'info');
+}
+</script>
+</body>
+</html>

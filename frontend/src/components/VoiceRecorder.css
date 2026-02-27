@@ -1,0 +1,181 @@
+/* ─── Voice Recorder ────────────────────────── */
+
+.recorder-body {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 16px;
+  padding: 8px 0 4px;
+}
+
+/* ─── Buttons ───────────────────────────────── */
+
+.recorder-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  font-family: var(--font-body);
+  font-size: 0.95rem;
+  font-weight: 500;
+  border: none;
+  border-radius: var(--radius-md);
+  cursor: pointer;
+  padding: 14px 28px;
+  transition: all var(--transition-base);
+}
+
+.recorder-btn-start {
+  background: var(--color-forest);
+  color: var(--color-white);
+}
+
+.recorder-btn-start:hover {
+  background: var(--color-forest-light);
+  transform: translateY(-1px);
+  box-shadow: 0 4px 16px rgba(45, 74, 62, 0.25);
+}
+
+.recorder-btn-start:active {
+  transform: translateY(0);
+}
+
+.recorder-btn-stop {
+  background: var(--color-error);
+  color: var(--color-white);
+}
+
+.recorder-btn-stop:hover {
+  background: #a93226;
+}
+
+.recorder-btn-again {
+  background: var(--color-cream-dark);
+  color: var(--color-charcoal);
+  padding: 8px 18px;
+  font-size: 0.85rem;
+}
+
+.recorder-btn-again:hover {
+  background: var(--color-border);
+}
+
+/* ─── Recording Active ──────────────────────── */
+
+.recorder-active {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 20px;
+  width: 100%;
+}
+
+.recorder-indicator {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.recorder-pulse {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: var(--color-error);
+  animation: recorderBlink 1s ease-in-out infinite;
+}
+
+.recorder-time {
+  font-family: var(--font-body);
+  font-size: 1.8rem;
+  font-weight: 600;
+  color: var(--color-charcoal);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.04em;
+}
+
+@keyframes recorderBlink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.25; }
+}
+
+/* ─── Live Transcript ───────────────────────── */
+
+.recorder-transcript {
+  width: 100%;
+  min-height: 80px;
+  max-height: 200px;
+  overflow-y: auto;
+  padding: 14px 16px;
+  background: var(--color-cream);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  font-family: var(--font-body);
+  font-size: 0.92rem;
+  line-height: 1.6;
+}
+
+.recorder-transcript-final {
+  color: var(--color-charcoal);
+}
+
+.recorder-transcript-partial {
+  color: var(--color-charcoal-light);
+  font-style: italic;
+}
+
+.recorder-transcript-placeholder {
+  color: var(--color-charcoal-light);
+  font-style: italic;
+  opacity: 0.6;
+}
+
+/* ─── Transcript Preview (success state) ──── */
+
+.recorder-transcript-preview {
+  width: 100%;
+  max-height: 120px;
+  overflow-y: auto;
+  padding: 10px 14px;
+  background: var(--color-cream);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  font-family: var(--font-body);
+  font-size: 0.85rem;
+  line-height: 1.5;
+  color: var(--color-charcoal-light);
+}
+
+/* ─── Status Messages ───────────────────────── */
+
+.recorder-status {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 0.92rem;
+  color: var(--color-charcoal-light);
+  flex-wrap: wrap;
+  justify-content: center;
+}
+
+.recorder-status-success {
+  color: var(--color-forest);
+}
+
+.recorder-status-error {
+  color: var(--color-error);
+}
+
+/* ─── Spinner ───────────────────────────────── */
+
+.recorder-spinner {
+  width: 20px;
+  height: 20px;
+  border: 2.5px solid var(--color-border);
+  border-top-color: var(--color-forest);
+  border-radius: 50%;
+  animation: recorderSpin 0.7s linear infinite;
+}
+
+@keyframes recorderSpin {
+  to { transform: rotate(360deg); }
+}
