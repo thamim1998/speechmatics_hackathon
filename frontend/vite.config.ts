@@ -6,9 +6,18 @@ export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, process.cwd(), '')
 
   return {
+    // server: {
+    //   proxy: {
+    //     '/api/call': 'http://localhost:3000',
+    //   },
+    // },
     server: {
       proxy: {
+        // keep existing call endpoint proxied to backend
         '/api/call': 'http://localhost:3000',
+    
+        // NEW: proxy caretaker endpoints to backend
+        '/api/caretaker': 'http://localhost:3000',
       },
     },
     plugins: [

@@ -20,6 +20,9 @@ import {
   pcm16kToMulaw8k,
 } from './speechmatics.js';
 
+import caretakerRouter from './routes/caretaker.js';
+import { bootstrapBackboard } from './backboard/bootstrap.js';
+
 const app = express();
 const PORT = 3000;
 
@@ -392,10 +395,35 @@ function sendAudioToTwilio(ws, streamSid, mulawBuffer) {
 
 // ─── Startup ────────────────────────────────────────────────────
 
-server.listen(PORT, () => {
-  console.log(`[server] Listening on http://localhost:${PORT}`);
-  console.log(`[ngrok] Public URL: ${publicUrl}`);
-  console.log(
-    `[ngrok] WebSocket URL: ${publicUrl.replace('https://', 'wss://')}/media-stream`,
-  );
+// server.listen(PORT, () => {
+//   console.log(`[server] Listening on http://localhost:${PORT}`);
+//   console.log(`[ngrok] Public URL: ${publicUrl}`);
+//   console.log(
+//     `[ngrok] WebSocket URL: ${publicUrl.replace('https://', 'wss://')}/media-stream`,
+//   );
+// });
+
+async function main() {
+  // ✅ Bootstrap Backboard (creates assistant/thread on first run)
+  const bb = await bootstrapBackboard();
+
+  // ✅ Mount caretaker routes (protected by X-CARETAKER-SECRET)
+  app.use('/api/caretaker', caretakerRouter({ threadId: bb.thread_id }));
+
+  console.log('[backboard] assistant_id:', bb.assistant_id);
+  console.log('[backboard] thread_id:', bb.thread_id);
+
+  // ✅ Start server (Twilio + WS code remains unchanged)
+  server.listen(PORT, () => {
+    console.log(`[server] Listening on http://localhost:${PORT}`);
+    console.log(`[ngrok] Public URL: ${publicUrl}`);
+    console.log(
+      `[ngrok] WebSocket URL: ${publicUrl.replace('https://', 'wss://')}/media-stream`,
+    );
+  });
+}
+
+main().catch((err) => {
+  console.error('[startup] failed:', err);
+  process.exit(1);
 });
