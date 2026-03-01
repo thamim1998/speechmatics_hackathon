@@ -32,22 +32,6 @@
 - Needs gentle reminders for meals, medications, and hydration (every 1-2 hours)
 - Enjoys music from his younger years, looking at photos, casual conversation
 
-## Recent Activity Log
-
-### February 27, 2026 (Thursday)
-- Hospital routine checkup
-- Bought medicines (refill)
-- Spoke with Thamimul and Ayush
-- Ate well (Indian food all meals)
-
-### Upcoming Plans
-- Travel to the mall to buy a gift for Thamimul's daughter (birthday)
-
-## Caretaker Notes (Ayush)
-| Date | Note |
-|------|------|
-| 2026-02-27 | Hospital checkup done. Medicines bought. Planning mall trip for Thamimul's daughter's gift. |
-
 ## Special Considerations
 - Has strong self-awareness of his condition — may experience grief or frustration
 - Focus on what he CAN do, not what he's lost

@@ -167,11 +167,71 @@ After each conversation, the agent:
 
 ---
 
+## Backboard Memory Management
+
+Use `backboard_utils.py` to inspect and manage Backboard's memory store.
+
+```bash
+# ── List ──
+uv run python backboard_utils.py memories list
+uv run python backboard_utils.py threads list
+uv run python backboard_utils.py documents list
+
+# ── Count ──
+uv run python backboard_utils.py memories count
+uv run python backboard_utils.py threads count
+uv run python backboard_utils.py documents count
+uv run python backboard_utils.py all count          # count everything
+
+# ── Delete one ──
+uv run python backboard_utils.py memories delete <memory_id>
+uv run python backboard_utils.py threads delete <thread_id>
+uv run python backboard_utils.py documents delete <document_id>
+
+# ── Wipe all ──
+uv run python backboard_utils.py memories wipe      # delete all memories
+uv run python backboard_utils.py threads wipe       # delete all threads
+uv run python backboard_utils.py documents wipe     # delete all documents
+uv run python backboard_utils.py all wipe            # delete everything
+
+# Add -y to skip confirmation
+uv run python backboard_utils.py all wipe -y
+```
+
+### Full Reset (fresh start)
+
+Creates a brand new assistant, uploads the patient profile, completely clean slate:
+
+```bash
+uv run python backboard_utils.py reset -y
+```
+
+### Memory Flow
+
+```
+Call 1: Patient tells Sarah about their day
+  → Backboard auto-extracts facts ("went to hospital", "bought medicines")
+  → Session summary saved to memory
+
+Call 2: Patient calls again
+  → Backboard retrieves relevant memories from Call 1
+  → Sarah remembers what the patient told her last time
+```
+
+Backboard stores three types of data:
+- **Documents** — patient_profile.md (static info, uploaded once)
+- **Memories** — auto-extracted facts from conversations (persistent across sessions)
+- **Threads** — individual conversation sessions (chat history within a call)
+
+---
+
 ## Project Structure
 
 ```
 demo/
 ├── livekit_agent.py          # LiveKit agent (recommended)
+├── dial.py                   # Outbound phone call via SIP trunk
+├── backboard_utils.py        # Memory inspection and management
 ├── demo.py                   # Standalone voice/text demo
 ├── pipecat_demo.py           # Pipecat WebRTC demo
 ├── patient_profile.md        # Patient info (uploaded to Backboard)
