@@ -37,6 +37,17 @@ export class BackboardClient {
     return JSON.parse(text);
   }
 
+  async updateAssistant(assistantId, { name, system_prompt }) {
+    const res = await fetch(`${BASE_URL}/assistants/${assistantId}`, {
+      method: 'PUT',
+      headers: this.jsonHeaders(),
+      body: JSON.stringify({ name, system_prompt }),
+    });
+    const text = await res.text();
+    mustOk(res, text);
+    return JSON.parse(text);
+  }
+
   async createThread(assistantId) {
     const res = await fetch(`${BASE_URL}/assistants/${assistantId}/threads`, {
       method: 'POST',
