@@ -12,13 +12,17 @@ import {
   addMessage,
   destroySession,
 } from './session.js';
-import { generateResponse, generateResponseStreaming, GREETING } from './counsellor.js';
+import {
+  generateResponseStreaming,
+  GREETING,
+} from './counsellor.js';
 import {
   createSTTClient,
   connectSTT,
   synthesizeSpeech,
   pcm16kToMulaw8k,
 } from './speechmatics.js';
+import { sendWhatsAppMessage } from './whatsapp.js';
 
 import caretakerRouter from './routes/caretaker.js';
 import { bootstrapBackboard } from './backboard/bootstrap.js';
@@ -121,6 +125,53 @@ app.post('/api/twiml', (req, res) => {
   </Response>`);
 });
 
+await sendWhatsAppMessage('Hello from the AI Counsellor!', '+919952072184');
+
+// Send a WhatsApp message
+app.post('/api/whatsapp', async (req, res) => {
+  const { text, phoneNumber } = req.body;
+
+  if (!text || !phoneNumber) {
+    return res.status(400).json({ error: 'text and phoneNumber are required' });
+  }
+
+  try {
+    const result = await sendWhatsAppMessage(text, phoneNumber);
+    if (result.success) {
+      res.json(result);
+    } else {
+      res.status(500).json(result);
+    }
+  } catch (err) {
+    console.error('[api/whatsapp] Error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Trigger a LiveKit outbound call (spawns livekit-agent.js)
+app.post('/api/livekit-call', async (req, res) => {
+  const { phoneNumber } = req.body;
+  if (!phoneNumber) {
+    return res.status(400).json({ error: 'phoneNumber is required' });
+  }
+
+  try {
+    const { spawn } = await import('child_process');
+    const child = spawn('node', ['livekit-agent.js', phoneNumber], {
+      cwd: new URL('.', import.meta.url).pathname,
+      stdio: 'inherit',
+      env: { ...process.env },
+    });
+
+    child.on('error', (err) => console.error('[livekit-call] Spawn error:', err.message));
+    console.log(`[api/livekit-call] Spawned agent for ${phoneNumber}, pid: ${child.pid}`);
+    res.json({ success: true, pid: child.pid });
+  } catch (err) {
+    console.error('[api/livekit-call] Error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ─── HTTP + WebSocket Server ────────────────────────────────────
 
 const server = createServer(app);
@@ -177,10 +228,16 @@ wss.on('connection', (ws) => {
             if (utteranceTimer) clearTimeout(utteranceTimer);
             utteranceTimer = setTimeout(() => {
               // Use finals + any trailing partial
-              const fullText = (session.currentUtterance + ' ' + (session.partialUtterance || '')).trim();
+              const fullText = (
+                session.currentUtterance +
+                ' ' +
+                (session.partialUtterance || '')
+              ).trim();
               session.currentUtterance = fullText;
               session.partialUtterance = '';
-              console.log(`[stt] Silence timeout — triggering response (utterance: "${fullText}")`);
+              console.log(
+                `[stt] Silence timeout — triggering response (utterance: "${fullText}")`,
+              );
               handleEndOfUtterance(callSid, ws);
             }, UTTERANCE_SILENCE_MS);
           },
@@ -194,25 +251,34 @@ wss.on('connection', (ws) => {
             // Reset silence timer — user is still speaking
             if (utteranceTimer) clearTimeout(utteranceTimer);
             utteranceTimer = setTimeout(() => {
-              console.log(`[stt] Silence timeout — triggering response (utterance: "${session.currentUtterance}")`);
+              console.log(
+                `[stt] Silence timeout — triggering response (utterance: "${session.currentUtterance}")`,
+              );
               handleEndOfUtterance(callSid, ws);
             }, UTTERANCE_SILENCE_MS);
           },
           onEndOfUtterance: () => {
             // Also trigger on native EndOfUtterance if it fires
-            const fullText = (session.currentUtterance + ' ' + (session.partialUtterance || '')).trim();
+            const fullText = (
+              session.currentUtterance +
+              ' ' +
+              (session.partialUtterance || '')
+            ).trim();
             session.currentUtterance = fullText;
             session.partialUtterance = '';
-            console.log(`[stt] EndOfUtterance — utterance: "${fullText}", isProcessing: ${session.isProcessing}`);
+            console.log(
+              `[stt] EndOfUtterance — utterance: "${fullText}", isProcessing: ${session.isProcessing}`,
+            );
             if (utteranceTimer) clearTimeout(utteranceTimer);
             handleEndOfUtterance(callSid, ws);
           },
         });
 
-        // Connect STT, then generate and play greeting
+        // Connect STT — greeting will play when first audio arrives (call confirmed connected)
         try {
           await connectSTT(session.sttClient);
-          await playGreeting(callSid, ws);
+          session.greetingPlayed = false;
+          console.log('[ws] STT connected, waiting for first media to play greeting');
         } catch (err) {
           console.error('[ws] Failed to initialize:', err.message);
         }
@@ -220,18 +286,32 @@ wss.on('connection', (ws) => {
       }
 
       case 'media': {
-        // Forward Twilio's mulaw audio to Speechmatics STT
         const session = getSession(callSid);
-        if (session?.sttClient) {
+        if (!session) break;
+
+        // Play greeting on first media event — this confirms the call is connected
+        if (!session.greetingPlayed) {
+          session.greetingPlayed = true;
+          console.log('[ws] First media received — call is connected, playing greeting');
+          playGreeting(callSid, ws);
+        }
+
+        // Forward Twilio's mulaw audio to Speechmatics STT
+        if (session.sttClient) {
           const audioBuffer = Buffer.from(msg.media.payload, 'base64');
           session.mediaChunkCount = (session.mediaChunkCount || 0) + 1;
           if (session.mediaChunkCount % 250 === 1) {
-            console.log(`[ws] Received ${session.mediaChunkCount} audio chunks from client (~${Math.round(session.mediaChunkCount * 20 / 1000)}s)`);
+            console.log(
+              `[ws] Received ${session.mediaChunkCount} audio chunks from client (~${Math.round((session.mediaChunkCount * 20) / 1000)}s)`,
+            );
           }
           try {
             session.sttClient.sendAudio(audioBuffer);
           } catch (err) {
-            if (session.mediaChunkCount <= 3) console.log(`[ws] sendAudio failed (expected during init): ${err.message}`);
+            if (session.mediaChunkCount <= 3)
+              console.log(
+                `[ws] sendAudio failed (expected during init): ${err.message}`,
+              );
           }
         }
         break;
@@ -272,10 +352,18 @@ async function playGreeting(callSid, ws) {
   addMessage(callSid, 'assistant', GREETING);
 
   // Forward transcript to client (Twilio ignores unknown event types)
-  try { ws.send(JSON.stringify({ event: 'transcript', transcript: { speaker: 'assistant', text: GREETING } })); } catch {};
+  try {
+    ws.send(
+      JSON.stringify({
+        event: 'transcript',
+        transcript: { speaker: 'assistant', text: GREETING },
+      }),
+    );
+  } catch {}
 
   try {
     const pcmAudio = await synthesizeSpeech(GREETING);
+    console.log(`[pipeline] Greeting TTS returned ${pcmAudio.length} bytes PCM`);
     const mulawAudio = pcm16kToMulaw8k(pcmAudio);
     sendAudioToTwilio(ws, session.streamSid, mulawAudio);
   } catch (err) {
@@ -295,12 +383,21 @@ async function handleEndOfUtterance(callSid, ws) {
 
   console.log(`[pipeline] Caller said: "${userText}"`);
   addMessage(callSid, 'user', userText);
-  try { ws.send(JSON.stringify({ event: 'transcript', transcript: { speaker: 'user', text: userText } })); } catch {};
+  try {
+    ws.send(
+      JSON.stringify({
+        event: 'transcript',
+        transcript: { speaker: 'user', text: userText },
+      }),
+    );
+  } catch {}
 
   try {
+    // Clear any buffered audio in Twilio before sending new response
+    ws.send(JSON.stringify({ event: 'clear', streamSid: session.streamSid }));
+
     // Stream Claude's response and TTS sentence-by-sentence for low latency.
-    // Each sentence is synthesized and sent as soon as it's complete,
-    // while Claude continues generating the rest.
+    // Claude generates text → TTS converts each sentence to audio → sent to Twilio.
     let buffer = '';
     const ttsQueue = [];
     let ttsRunning = false;
@@ -311,7 +408,9 @@ async function handleEndOfUtterance(callSid, ws) {
       while (ttsQueue.length > 0) {
         const sentence = ttsQueue.shift();
         try {
+          console.log(`[pipeline] TTS synthesizing: "${sentence}"`);
           const pcmAudio = await synthesizeSpeech(sentence);
+          console.log(`[pipeline] TTS returned ${pcmAudio.length} bytes PCM`);
           const mulawAudio = pcm16kToMulaw8k(pcmAudio);
           sendAudioToTwilio(ws, session.streamSid, mulawAudio);
         } catch (err) {
@@ -329,15 +428,18 @@ async function handleEndOfUtterance(callSid, ws) {
       processTtsQueue();
     };
 
-    const responseText = await generateResponseStreaming(session.messages, (chunk) => {
-      buffer += chunk;
-      // Split on sentence boundaries: . ! ? followed by space or end
-      const match = buffer.match(/^(.*?[.!?])\s+(.*)$/s);
-      if (match) {
-        enqueueSentence(match[1]);
-        buffer = match[2];
-      }
-    });
+    const responseText = await generateResponseStreaming(
+      session.messages,
+      (chunk) => {
+        buffer += chunk;
+        // Split on sentence boundaries: . ! ? followed by space or end
+        const match = buffer.match(/^(.*?[.!?])\s+(.*)$/s);
+        if (match) {
+          enqueueSentence(match[1]);
+          buffer = match[2];
+        }
+      },
+    );
 
     // Flush remaining text
     if (buffer.trim()) {
@@ -349,16 +451,16 @@ async function handleEndOfUtterance(callSid, ws) {
       await new Promise((r) => setTimeout(r, 100));
     }
 
-    console.log(`[pipeline] Counsellor: "${responseText}"`);
+    console.log(`[pipeline] Response complete (text only, TTS already spoke it): "${responseText}"`);
     addMessage(callSid, 'assistant', responseText);
-    try { ws.send(JSON.stringify({ event: 'transcript', transcript: { speaker: 'assistant', text: responseText } })); } catch {};
-
-    // Send mark after all audio
-    ws.send(JSON.stringify({
-      event: 'mark',
-      streamSid: session.streamSid,
-      mark: { name: `speech_${Date.now()}` },
-    }));
+    try {
+      ws.send(
+        JSON.stringify({
+          event: 'transcript',
+          transcript: { speaker: 'assistant', text: responseText },
+        }),
+      );
+    } catch {}
   } catch (err) {
     console.error('[pipeline] Response pipeline failed:', err.message);
   } finally {
@@ -367,6 +469,13 @@ async function handleEndOfUtterance(callSid, ws) {
 }
 
 function sendAudioToTwilio(ws, streamSid, mulawBuffer) {
+  if (ws.readyState !== 1) {
+    console.error('[audio] WebSocket not open, cannot send audio');
+    return;
+  }
+
+  console.log(`[audio] Sending ${mulawBuffer.length} bytes (${(mulawBuffer.length / 8000).toFixed(1)}s) to Twilio, streamSid: ${streamSid}`);
+
   // Chunk into ~8KB pieces (1 second of 8kHz mulaw audio)
   const CHUNK_SIZE = 8000;
 
