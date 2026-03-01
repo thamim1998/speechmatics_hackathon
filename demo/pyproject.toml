@@ -9,6 +9,7 @@ dependencies = [
     "fastapi>=0.134.0",
     "firebase-admin>=7.2.0",
     "livekit-agents[openai,silero,speechmatics]>=1.4,<1.5",
+    "livekit-plugins-backboard",
     "numpy>=2.2,<2.3",
     "pipecat-ai-small-webrtc-prebuilt>=2.3.0",
     "pipecat-ai[silero,speechmatics,webrtc]>=0.0.103",
@@ -18,3 +19,6 @@ dependencies = [
     "uvicorn>=0.41.0",
     "websockets>=13",
 ]
+
+[tool.uv.sources]
+livekit-plugins-backboard = { path = "packages/livekit-plugins-backboard" }

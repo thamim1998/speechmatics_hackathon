@@ -363,6 +363,7 @@ dependencies = [
     { name = "fastapi" },
     { name = "firebase-admin" },
     { name = "livekit-agents", extra = ["openai", "silero", "speechmatics"] },
+    { name = "livekit-plugins-backboard" },
     { name = "numpy" },
     { name = "pipecat-ai", extra = ["silero", "speechmatics", "webrtc"] },
     { name = "pipecat-ai-small-webrtc-prebuilt" },
@@ -379,6 +380,7 @@ requires-dist = [
     { name = "fastapi", specifier = ">=0.134.0" },
     { name = "firebase-admin", specifier = ">=7.2.0" },
     { name = "livekit-agents", extras = ["openai", "silero", "speechmatics"], specifier = ">=1.4,<1.5" },
+    { name = "livekit-plugins-backboard", directory = "packages/livekit-plugins-backboard" },
     { name = "numpy", specifier = ">=2.2,<2.3" },
     { name = "pipecat-ai", extras = ["silero", "speechmatics", "webrtc"], specifier = ">=0.0.103" },
     { name = "pipecat-ai-small-webrtc-prebuilt", specifier = ">=2.3.0" },
@@ -1171,6 +1173,21 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/6b/9f/ec51ebce455e17b6f304044e2bda57b15b1b45fd20b2feefa6e242fa33c6/livekit_blingfire-1.1.0-cp312-cp312-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:502d7a41fed246ec9cc432646d523c488a05fb2e572187a754735532ba5d69b7", size = 167606, upload-time = "2025-12-16T00:48:13.611Z" },
     { url = "https://files.pythonhosted.org/packages/d1/19/a4b56e54af456f2667287497f7678ff69a82ad21a687fc540213b4f25982/livekit_blingfire-1.1.0-cp312-cp312-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:cdec36ea4d8b0dcda2791358ac9965e832539ecf13e651011197bab9960ea156", size = 174972, upload-time = "2025-12-16T00:48:14.811Z" },
     { url = "https://files.pythonhosted.org/packages/32/29/032cbf2c88ca40bee25b8a1b5346b5cb66487e689c4f42dd19f7e745090d/livekit_blingfire-1.1.0-cp312-cp312-win_amd64.whl", hash = "sha256:28d8c822616ca2ce53125040dfe09d06a6cc3e63c9055d39ca767a5c8f67ef84", size = 131026, upload-time = "2025-12-16T00:48:16.047Z" },
+]
+
+[[package]]
+name = "livekit-plugins-backboard"
+version = "0.1.0"
+source = { directory = "packages/livekit-plugins-backboard" }
+dependencies = [
+    { name = "httpx" },
+    { name = "livekit-agents" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "httpx" },
+    { name = "livekit-agents", specifier = ">=1.4,<1.5" },
 ]
 
 [[package]]

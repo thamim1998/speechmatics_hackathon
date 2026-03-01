@@ -1,0 +1,16 @@
+[project]
+name = "livekit-plugins-backboard"
+version = "0.1.0"
+description = "Backboard.io LLM plugin for LiveKit Agents"
+requires-python = ">=3.11"
+dependencies = [
+    "httpx",
+    "livekit-agents>=1.4,<1.5",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["livekit"]
