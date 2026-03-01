@@ -30,7 +30,7 @@ import {
   LocalAudioTrack,
   AudioFrame,
 } from '@livekit/rtc-node';
-import { createSTTClient, synthesizeSpeech } from './speechmatics.js';
+import { createSTTClient, synthesizeSpeech, synthesizeSpeechStreaming } from './speechmatics.js';
 import { createSpeechmaticsJWT } from '@speechmatics/auth';
 import { generateResponseStreaming, GREETING } from './counsellor.js';
 
@@ -45,18 +45,21 @@ const {
 
 const PHONE_NUMBER = process.argv[2];
 const ROOM_NAME = `call-${Date.now()}`;
-const SILENCE_MS_SHORT = 300;    // used when utterance looks complete
-const SILENCE_MS_DEFAULT = 500;  // used when user might still be talking
 const AGENT_SAMPLE_RATE = 16000; // matches Speechmatics TTS output
 
-/** Short timeout if >3 words and ends cleanly; default otherwise */
-function getSilenceTimeout(text) {
-  const trimmed = text.trim();
-  const words = trimmed.split(/\s+/);
-  if (words.length > 3 && /[.!?,;:]$/.test(trimmed)) return SILENCE_MS_SHORT;
-  if (words.length > 3 && /\w$/.test(trimmed)) return SILENCE_MS_SHORT;
-  return SILENCE_MS_DEFAULT;
-}
+// ─── Pipeline Tuning Constants ──────────────────────────────────
+const FLUSH_CHARS_MIN   = 80;    // min chars before considering a buffer flush
+const FLUSH_TIMEOUT_MS  = 350;   // max ms between flushes
+const TTS_BATCH_TARGET  = 200;   // ideal chars per TTS call (~2s speech)
+const TTS_BATCH_MIN     = 40;    // min chars for punctuation-triggered flush
+const COMMIT_DELAY_SHORT_MS = 700;  // delay for 1–2 word utterances (phone pauses are longer)
+const COMMIT_DELAY_LONG_MS  = 400;  // delay for 3+ word utterances
+const VAD_NOISE_FLOOR_INIT  = 200;  // initial noise floor estimate
+const VAD_NOISE_ALPHA       = 0.03; // EMA smoothing factor for noise floor update
+const VAD_THRESHOLD_FACTOR  = 3.0;  // speech threshold = noiseFloor * factor
+const VAD_FLOOR_MIN         = 50;   // minimum noise floor — prevents threshold reaching 0
+const VAD_FLOOR_MAX         = 1500; // cap noise floor for extremely noisy lines
+const VAD_SILENCE_MS        = 250;  // ms of sub-threshold RMS before "silence"
 
 if (!PHONE_NUMBER) {
   console.error('Usage: node livekit-agent.js <+phoneNumber>');
@@ -76,6 +79,7 @@ if (!SPEECHMATICS_API_KEY) {
 // ─── AudioPlayer (20ms real-time pacing) ──────────────────────
 const FRAME_DURATION_MS = 20;
 const SAMPLES_PER_FRAME = (AGENT_SAMPLE_RATE * FRAME_DURATION_MS) / 1000; // 320
+const SPEECH_TAIL_MS = 800; // ms to keep isSpeaking() true after drain ends (phone echo drain)
 
 class AudioPlayer {
   constructor(source) {
@@ -84,13 +88,18 @@ class AudioPlayer {
     this._draining = false;
     this._stopped = false;
     this._doneResolvers = [];
+    this._speakingUntil = 0;
   }
 
-  isPlaying() { return this._draining; }
+  /** True while audio is playing OR within the echo tail after playback ends */
+  isSpeaking() {
+    return this._draining || performance.now() < this._speakingUntil;
+  }
 
   stopNow() {
     this._stopped = true;
     this._queue.length = 0;
+    this._speakingUntil = performance.now() + SPEECH_TAIL_MS;
     // Resolve all waiters immediately so pipeline unblocks
     for (const resolve of this._doneResolvers) resolve();
     this._doneResolvers = [];
@@ -141,6 +150,7 @@ class AudioPlayer {
     }
 
     this._draining = false;
+    this._speakingUntil = performance.now() + SPEECH_TAIL_MS;
     // Notify all waiters
     for (const resolve of this._doneResolvers) resolve();
     this._doneResolvers = [];
@@ -152,8 +162,12 @@ let messages = [];           // Claude conversation history [{role, content}]
 let currentUtterance = '';   // Confirmed finals accumulated
 let partialUtterance = '';   // Latest partial (tentative)
 let isProcessing = false;    // Guard against concurrent responses
-let utteranceTimer = null;
 let generationId = 0;        // Incremented on barge-in to invalidate stale TTS
+let lastSpeechTime = 0;      // timestamp of last VAD-detected speech
+let noiseFloor = VAD_NOISE_FLOOR_INIT; // adaptive noise floor estimate (EMA)
+let commitTimer = null;      // delay timer before committing to response
+let currentAbortController = null; // AbortController for current LLM+TTS turn
+let heardUserSpeech = false;       // true when VAD detects speech while agent is NOT speaking
 
 // ─── Latency Tracking ─────────────────────────────────────────
 let t_lastAudioPacket = 0;  // timestamp of last audio packet from user
@@ -207,10 +221,22 @@ async function connectSTTForLiveKit(client) {
   console.log('[stt] Connected to Speechmatics (PCM s16le, 16kHz)');
 }
 
+/** Compute RMS energy of PCM Int16 samples for voice activity detection */
+function computeRMS(int16Array) {
+  let sum = 0;
+  for (let i = 0; i < int16Array.length; i++) sum += int16Array[i] * int16Array[i];
+  return Math.sqrt(sum / int16Array.length);
+}
+
 // ─── TTS Phrase Cache ─────────────────────────────────────────
 const ttsCache = new Map();
 
-const BRIDGE_FILLERS = ["Mm-hm.", "Okay.", "Right."];
+const BRIDGE_FILLERS = [
+  "Got it, one sec.",
+  "I hear you, let me think.",
+  "Okay, give me a moment.",
+  "Right, let me consider that.",
+];
 
 const CACHE_WARMUP_PHRASES = [
   GREETING,
@@ -228,13 +254,13 @@ const CACHE_WARMUP_PHRASES = [
 
 let bridgeIndex = 0;
 
-async function cachedSynthesizeSpeech(text) {
+async function cachedSynthesizeSpeech(text, { signal } = {}) {
   const key = text.toLowerCase().trim();
   if (ttsCache.has(key)) {
     console.log(`  ⚡ TTS cache hit: "${text.slice(0, 40)}..."`);
     return ttsCache.get(key);
   }
-  const pcm = await synthesizeSpeech(text);
+  const pcm = await synthesizeSpeech(text, 'sarah', { signal });
   ttsCache.set(key, pcm);
   return pcm;
 }
@@ -267,6 +293,9 @@ async function playGreeting(player) {
     player.enqueue(pcmAudio);
     logLatency('Greeting enqueue', t1, ms());
     await player.waitUntilDone();
+    currentUtterance = '';
+    partialUtterance = '';
+    heardUserSpeech = false;
     console.log('[pipeline] Greeting played');
   } catch (err) {
     console.error('[pipeline] Greeting TTS failed:', err.message);
@@ -279,9 +308,27 @@ async function handleEndOfUtterance(player) {
   const userText = currentUtterance.trim();
   if (!userText) return;
 
+  // Filter garbage / too-short STT outputs (".", "Hi .", "High", etc.)
+  const MIN_INPUT_CHARS = 4;
+  const stripped = userText.replace(/[\s.!?,;:'"()\-]+/g, '');
+  if (stripped.length < MIN_INPUT_CHARS) {
+    console.log(`[filter] Skipping short/empty input: "${userText}"`);
+    currentUtterance = '';
+    partialUtterance = '';
+    return;
+  }
+
   isProcessing = true;
   currentUtterance = '';
   partialUtterance = '';
+
+  // Abort any previous in-flight turn
+  if (currentAbortController) {
+    currentAbortController.abort();
+  }
+  const abortController = new AbortController();
+  currentAbortController = abortController;
+  const { signal } = abortController;
 
   const t_endpointDetected = ms();
 
@@ -291,58 +338,97 @@ async function handleEndOfUtterance(player) {
   messages.push({ role: 'user', content: userText });
 
   try {
-    // ── Play instant bridge filler to hide LLM latency ──
+    // ── Play bridge filler to keep isSpeaking()=true during LLM wait ──
     const filler = BRIDGE_FILLERS[bridgeIndex++ % BRIDGE_FILLERS.length];
-    const fillerPcm = ttsCache.get(filler.toLowerCase().trim());
+    let fillerPcm = ttsCache.get(filler.toLowerCase().trim());
+    if (!fillerPcm) {
+      try { fillerPcm = await synthesizeSpeech(filler, 'sarah', { signal }); } catch {}
+    }
     if (fillerPcm) {
-      console.log(`  ⚡ Bridge: "${filler}"`);
+      console.log(`  [bridge] "${filler}"`);
       player.enqueue(fillerPcm);
     }
 
-    // ── Parallel TTS pipeline ──
-    // Producer: fires TTS immediately on sentence boundary (stores promises)
-    // Consumer: awaits promises in order and enqueues audio to player
-    let buffer = '';
+    // ── Two-level accumulation: buffer → ttsAccum → TTS ──
+    let buffer = '';          // raw LLM chunks
+    let ttsAccum = '';        // flushed text waiting for TTS batch
     let t_llmFirstToken = 0;
+    let lastFlushTime = ms();
     let sentenceIndex = 0;
-    const thisGenId = generationId; // Capture — if barge-in bumps it, we bail
-    const ttsTasks = []; // ordered array of { promise, sentence, idx, t_boundary }
+    const thisGenId = generationId;
+    const ttsTasks = [];
 
-    const fireTts = (sentence) => {
-      const trimmed = sentence.trim();
+    const fireTts = (text) => {
+      const trimmed = text.trim();
       if (!trimmed) return;
+      if (signal.aborted) { console.log(`  [skip] aborted`); return; }
       const idx = sentenceIndex++;
-      logLatency(`S${idx} LLM→TTS start (sentence boundary − endpoint)`, t_endpointDetected, ms());
-      // Fire TTS immediately — don't wait for previous sentence to finish playing
+      logLatency(`S${idx} LLM->TTS start`, t_endpointDetected, ms());
+      const key = trimmed.toLowerCase().trim();
       const promise = (async () => {
         const t_ttsStart = ms();
-        const pcm = await cachedSynthesizeSpeech(trimmed);
-        logLatency(`S${idx} TTS synthesis`, t_ttsStart, ms());
-        return pcm;
+        if (ttsCache.has(key)) {
+          console.log(`  ⚡ TTS cache hit: "${trimmed.slice(0, 40)}..."`);
+          logLatency(`S${idx} TTS synthesis (cached)`, t_ttsStart, ms());
+          return ttsCache.get(key); // Returns Buffer
+        }
+        // Stream for cache misses — returns ReadableStream
+        const stream = await synthesizeSpeechStreaming(trimmed, 'sarah', { signal });
+        logLatency(`S${idx} TTS stream started`, t_ttsStart, ms());
+        return stream;
       })();
       ttsTasks.push({ promise, sentence: trimmed, idx });
     };
+
+    /** Flush buffer → ttsAccum, then fire TTS if ttsAccum is large enough */
+    const flushBuffer = () => {
+      if (!buffer) return;
+      ttsAccum += buffer;
+      buffer = '';
+      lastFlushTime = ms();
+      // Fire TTS when ttsAccum hits batch target
+      if (ttsAccum.length >= TTS_BATCH_TARGET) {
+        fireTts(ttsAccum);
+        ttsAccum = '';
+      }
+    };
+
+    // 50ms interval to catch time-threshold flushes between LLM chunks
+    const flushInterval = setInterval(() => {
+      if (buffer && (ms() - lastFlushTime >= FLUSH_TIMEOUT_MS)) {
+        flushBuffer();
+      }
+    }, 50);
 
     const t_llmStart = ms();
     logLatency('STT finalize (endpoint → LLM request)', t_endpointDetected, t_llmStart);
 
     const responseText = await generateResponseStreaming(messages, (chunk) => {
+      if (signal.aborted) return;
       if (!t_llmFirstToken) {
         t_llmFirstToken = ms();
         logLatency('LLM TTFT (first token)', t_llmStart, t_llmFirstToken);
       }
       buffer += chunk;
-      // Split on sentence boundaries: . ! ? followed by space or end
-      const match = buffer.match(/^(.*?[.!?])\s+(.*)$/s);
-      if (match) {
-        fireTts(match[1]);
-        buffer = match[2];
-      }
-    });
 
-    // Flush remaining text
+      // Flush rules: char threshold OR punctuation + min chars
+      if (buffer.length >= FLUSH_CHARS_MIN) {
+        flushBuffer();
+      } else if (/[.!?,]/.test(chunk) && buffer.length >= TTS_BATCH_MIN) {
+        flushBuffer();
+      }
+    }, { signal });
+
+    clearInterval(flushInterval);
+
+    // Force flush any remaining text
     if (buffer.trim()) {
-      fireTts(buffer);
+      ttsAccum += buffer;
+      buffer = '';
+    }
+    if (ttsAccum.trim()) {
+      fireTts(ttsAccum);
+      ttsAccum = '';
     }
 
     const t_llmDone = ms();
@@ -350,40 +436,95 @@ async function handleEndOfUtterance(player) {
 
     // Consumer: await each TTS result in order, enqueue to player
     for (const { promise, sentence, idx } of ttsTasks) {
-      if (generationId !== thisGenId) {
-        console.log(`  🛑 S${idx}: discarded (barge-in)`);
+      if (generationId !== thisGenId || signal.aborted) {
+        console.log(`  [skip] S${idx}: discarded (barge-in)`);
         continue;
       }
       try {
-        const pcmAudio = await promise;
-        if (generationId !== thisGenId) {
-          console.log(`  🛑 S${idx}: discarded after TTS (barge-in)`);
+        const result = await promise;
+        if (generationId !== thisGenId || signal.aborted) {
+          console.log(`  [skip] S${idx}: discarded after TTS (barge-in)`);
           continue;
         }
-        player.enqueue(pcmAudio);
-        const t_enqueued = ms();
-        logLatency(`S${idx} TOTAL (endpoint → audio enqueued)`, t_endpointDetected, t_enqueued);
-        console.log(`  📢 S${idx}: "${sentence}" (${(pcmAudio.length / 2 / AGENT_SAMPLE_RATE).toFixed(1)}s audio)`);
+
+        if (result instanceof Buffer) {
+          // Cache hit — full buffer, enqueue immediately
+          player.enqueue(result);
+          const t_enqueued = ms();
+          logLatency(`S${idx} TOTAL (endpoint → audio enqueued)`, t_endpointDetected, t_enqueued);
+          console.log(`  S${idx}: "${sentence}" (${(result.length / 2 / AGENT_SAMPLE_RATE).toFixed(1)}s audio)`);
+        } else {
+          // Stream — read chunks and enqueue incrementally
+          // Must maintain even byte alignment for Int16 PCM samples
+          const reader = result.getReader();
+          const chunks = [];
+          let totalBytes = 0;
+          let leftover = null; // dangling byte from odd-length chunk
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            if (generationId !== thisGenId || signal.aborted) {
+              reader.cancel();
+              console.log(`  [skip] S${idx}: stream cancelled (barge-in)`);
+              break;
+            }
+            let buf = Buffer.from(value);
+            // Prepend any leftover byte from previous chunk
+            if (leftover) {
+              buf = Buffer.concat([leftover, buf]);
+              leftover = null;
+            }
+            // Hold back dangling byte if odd length
+            if (buf.length % 2 !== 0) {
+              leftover = buf.slice(buf.length - 1);
+              buf = buf.slice(0, buf.length - 1);
+            }
+            if (buf.length > 0) {
+              player.enqueue(buf);
+              chunks.push(buf);
+              totalBytes += buf.length;
+            }
+          }
+          const t_enqueued = ms();
+          logLatency(`S${idx} TOTAL (endpoint → stream done)`, t_endpointDetected, t_enqueued);
+          console.log(`  S${idx}: "${sentence}" (${(totalBytes / 2 / AGENT_SAMPLE_RATE).toFixed(1)}s audio, streamed)`);
+          // Cache the full buffer for future hits
+          if (chunks.length > 0) {
+            const fullBuf = Buffer.concat(chunks);
+            ttsCache.set(sentence.toLowerCase().trim(), fullBuf);
+          }
+        }
       } catch (err) {
+        if (signal.aborted) { console.log(`  [skip] S${idx}: aborted`); continue; }
         console.error(`[pipeline] S${idx} TTS failed:`, err.message);
       }
     }
 
     // Wait for all audio to finish playing (unless barged in)
-    if (generationId === thisGenId) {
+    if (generationId === thisGenId && !signal.aborted) {
       await player.waitUntilDone();
     }
+    currentUtterance = '';
+    partialUtterance = '';
+    heardUserSpeech = false;
 
     const t_allDone = ms();
-    const bargedIn = generationId !== thisGenId;
+    const bargedIn = generationId !== thisGenId || signal.aborted;
     logLatency(`Full turn (endpoint → ${bargedIn ? 'barge-in' : 'all audio played'})`, t_endpointDetected, t_allDone);
     console.log(`━━━ End turn${bargedIn ? ' (interrupted)' : ''}: "${responseText}" ━━━\n`);
 
     messages.push({ role: 'assistant', content: responseText });
   } catch (err) {
-    console.error('[pipeline] Response pipeline failed:', err.message);
+    if (signal.aborted) {
+      console.log(`[pipeline] Turn aborted`);
+    } else {
+      console.error('[pipeline] Response pipeline failed:', err.message);
+    }
   } finally {
     isProcessing = false;
+    if (currentAbortController === abortController) {
+      currentAbortController = null;
+    }
   }
 }
 
@@ -442,71 +583,86 @@ async function main() {
     if (track.kind !== TrackKind.KIND_AUDIO) return;
     console.log(`[agent] Subscribed to audio from: ${participant.identity}`);
 
-    // Create Speechmatics STT with silence-timeout logic
+    // Create Speechmatics STT — gated by player.isSpeaking()
     const sttClient = createSTTClient({
       onPartial: (text) => {
+        if (player.isSpeaking()) return;
         partialUtterance = text;
-
-        // ── Barge-in: user started talking while agent is playing ──
-        if (text.trim() && player.isPlaying()) {
-          console.log(`[barge-in] 🛑 User interrupted: "${text.trim()}"`);
-          generationId++;
-          player.stopNow();
-          isProcessing = false;
-        }
-
-        // Reset silence timer — user is still speaking
-        if (utteranceTimer) clearTimeout(utteranceTimer);
-        const pending = (currentUtterance + ' ' + text).trim();
-        const silenceMs = getSilenceTimeout(pending);
-        utteranceTimer = setTimeout(() => {
-          const fullText = (currentUtterance + ' ' + (partialUtterance || '')).trim();
-          currentUtterance = fullText;
-          partialUtterance = '';
-          console.log(`[stt] Silence timeout (${silenceMs}ms) — triggering response (utterance: "${fullText}")`);
-          handleEndOfUtterance(player);
-        }, silenceMs);
+        if (commitTimer) { clearTimeout(commitTimer); commitTimer = null; }
       },
       onFinal: (text) => {
+        if (player.isSpeaking()) return;
         console.log(`[stt] Final: "${text}"`);
         if (text.trim()) {
           currentUtterance += (currentUtterance ? ' ' : '') + text;
         }
         partialUtterance = '';
-        if (utteranceTimer) clearTimeout(utteranceTimer);
-        const silenceMs = getSilenceTimeout(currentUtterance);
-        utteranceTimer = setTimeout(() => {
-          console.log(`[stt] Silence timeout (${silenceMs}ms) — triggering response (utterance: "${currentUtterance}")`);
-          handleEndOfUtterance(player);
-        }, silenceMs);
+        if (commitTimer) { clearTimeout(commitTimer); commitTimer = null; }
       },
       onEndOfUtterance: () => {
         const fullText = (currentUtterance + ' ' + (partialUtterance || '')).trim();
         currentUtterance = fullText;
         partialUtterance = '';
-        console.log(`[stt] EndOfUtterance — utterance: "${fullText}", isProcessing: ${isProcessing}`);
-        if (utteranceTimer) clearTimeout(utteranceTimer);
-        handleEndOfUtterance(player);
+        console.log(`[stt] EndOfUtterance — utterance: "${fullText}"`);
       },
     });
 
-    // Connect STT, then wait for SIP call to be answered before greeting
     await connectSTTForLiveKit(sttClient);
+
+    // Start consuming audio frames IMMEDIATELY (prevents buffer buildup during greeting)
+    const audioStream = new AudioStream(track, AGENT_SAMPLE_RATE, 1);
+    (async () => {
+      for await (const frame of audioStream) {
+        t_lastAudioPacket = ms();
+
+        const samples = new Int16Array(frame.data.buffer, frame.data.byteOffset, frame.data.byteLength / 2);
+        const rms = computeRMS(samples);
+        const vadThreshold = noiseFloor * VAD_THRESHOLD_FACTOR;
+
+        if (rms > vadThreshold) {
+          lastSpeechTime = ms();
+          if (!player.isSpeaking() && !heardUserSpeech) {
+            heardUserSpeech = true;
+            // Discard any echo text that accumulated before user spoke
+            currentUtterance = '';
+            partialUtterance = '';
+          }
+          if (commitTimer) { clearTimeout(commitTimer); commitTimer = null; }
+        } else {
+          noiseFloor = noiseFloor * (1 - VAD_NOISE_ALPHA) + rms * VAD_NOISE_ALPHA;
+          if (noiseFloor < VAD_FLOOR_MIN) noiseFloor = VAD_FLOOR_MIN;
+          if (noiseFloor > VAD_FLOOR_MAX) noiseFloor = VAD_FLOOR_MAX;
+
+          const silenceDuration = ms() - lastSpeechTime;
+          const pendingText = (currentUtterance + ' ' + (partialUtterance || '')).trim();
+
+          if (silenceDuration >= VAD_SILENCE_MS && pendingText && !isProcessing && !commitTimer && !player.isSpeaking() && heardUserSpeech) {
+            console.log(`[vad] Silence detected (${silenceDuration.toFixed(0)}ms, RMS=${rms.toFixed(0)}, floor=${noiseFloor.toFixed(0)}, thresh=${vadThreshold.toFixed(0)})`);
+            const wordCount = pendingText.split(/\s+/).length;
+            const commitDelay = wordCount <= 2 ? COMMIT_DELAY_SHORT_MS : COMMIT_DELAY_LONG_MS;
+            commitTimer = setTimeout(() => {
+              commitTimer = null;
+              const fullText = (currentUtterance + ' ' + (partialUtterance || '')).trim();
+              currentUtterance = fullText;
+              partialUtterance = '';
+              console.log(`[vad] Commit delay elapsed (${commitDelay}ms, ${wordCount} words) — triggering response: "${fullText}"`);
+              handleEndOfUtterance(player);
+            }, commitDelay);
+          }
+        }
+
+        // Only forward audio to STT when agent is not speaking
+        if (!player.isSpeaking()) {
+          try { sttClient.sendAudio(frame.data); } catch {}
+        }
+      }
+    })(); // frame loop runs concurrently — don't await
+
+    // Play greeting AFTER frame loop starts (frames consumed in real-time, no buffer buildup)
     console.log('[agent] Waiting for SIP call to be answered before greeting...');
     await callAnswered;
     await new Promise(r => setTimeout(r, 300));
     await playGreeting(player);
-
-    // Stream phone audio to Speechmatics STT
-    const audioStream = new AudioStream(track, AGENT_SAMPLE_RATE, 1);
-    for await (const frame of audioStream) {
-      t_lastAudioPacket = ms();
-      try {
-        sttClient.sendAudio(frame.data);
-      } catch (err) {
-        // Expected during init, suppress
-      }
-    }
   });
 
   await room.connect(LIVEKIT_URL, agentToken, { autoSubscribe: true });
