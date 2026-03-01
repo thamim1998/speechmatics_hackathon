@@ -515,7 +515,7 @@ async function main() {
   const bb = await bootstrapBackboard();
 
   // ✅ Mount caretaker routes (protected by X-CARETAKER-SECRET)
-  app.use('/api/caretaker', caretakerRouter({ threadId: bb.thread_id }));
+  app.use('/api/caretaker', caretakerRouter({ threadId: bb.thread_id, assistantId: bb.assistant_id }));
 
   console.log('[backboard] assistant_id:', bb.assistant_id);
   console.log('[backboard] thread_id:', bb.thread_id);
