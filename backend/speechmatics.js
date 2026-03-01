@@ -61,7 +61,7 @@ export async function connectSTT(client) {
 
 // ─── TTS (REST API) ─────────────────────────────────────────────
 
-export async function synthesizeSpeech(text, voice = 'sarah') {
+export async function synthesizeSpeech(text, voice = 'sarah', { signal } = {}) {
   const url = `${TTS_BASE_URL}/${voice}?output_format=pcm_16000`;
 
   const response = await fetch(url, {
@@ -71,6 +71,7 @@ export async function synthesizeSpeech(text, voice = 'sarah') {
       'Content-Type': 'application/json',
     },
     body: JSON.stringify({ text }),
+    signal,
   });
 
   if (!response.ok) {
@@ -81,6 +82,30 @@ export async function synthesizeSpeech(text, voice = 'sarah') {
   // Returns raw PCM 16-bit signed LE at 16kHz
   const arrayBuffer = await response.arrayBuffer();
   return Buffer.from(arrayBuffer);
+}
+
+/**
+ * Streaming TTS — returns a ReadableStream of PCM chunks instead of buffering.
+ * Used by the LiveKit pipeline for lower time-to-first-audio on cache misses.
+ */
+export async function synthesizeSpeechStreaming(text, voice = 'sarah', { signal } = {}) {
+  const url = `${TTS_BASE_URL}/${voice}?output_format=pcm_16000`;
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${SPEECHMATICS_API_KEY}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ text }),
+    signal,
+  });
+
+  if (!response.ok) {
+    const errText = await response.text();
+    throw new Error(`TTS failed (${response.status}): ${errText}`);
+  }
+
+  return response.body; // ReadableStream of PCM chunks
 }
 
 // ─── Audio Conversion ───────────────────────────────────────────
