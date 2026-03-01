@@ -14,7 +14,7 @@ import {
 } from './session.js';
 import {
   generateResponseStreaming,
-  GREETING,
+  GREETING_FALLBACK as GREETING,
 } from './counsellor.js';
 import {
   createSTTClient,
@@ -124,8 +124,6 @@ app.post('/api/twiml', (req, res) => {
     </Connect>
   </Response>`);
 });
-
-await sendWhatsAppMessage('Hello from the AI Counsellor!', '+919952072184');
 
 // Send a WhatsApp message
 app.post('/api/whatsapp', async (req, res) => {

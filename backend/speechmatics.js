@@ -108,6 +108,124 @@ export async function synthesizeSpeechStreaming(text, voice = 'sarah', { signal 
   return response.body; // ReadableStream of PCM chunks
 }
 
+// ─── Batch Analysis (Post-Call Sentiment + Summary) ─────────────
+
+const BATCH_BASE_URL = 'https://asr.api.speechmatics.com/v2';
+
+/**
+ * Create a WAV buffer from raw PCM data.
+ * 44-byte WAV header + PCM payload. No external library needed.
+ */
+export function createWavBuffer(pcmData, sampleRate = 16000, channels = 1, bitsPerSample = 16) {
+  const byteRate = sampleRate * channels * (bitsPerSample / 8);
+  const blockAlign = channels * (bitsPerSample / 8);
+  const dataSize = pcmData.length;
+  const headerSize = 44;
+  const buffer = Buffer.alloc(headerSize + dataSize);
+
+  // RIFF header
+  buffer.write('RIFF', 0);
+  buffer.writeUInt32LE(36 + dataSize, 4); // file size - 8
+  buffer.write('WAVE', 8);
+
+  // fmt sub-chunk
+  buffer.write('fmt ', 12);
+  buffer.writeUInt32LE(16, 16);            // sub-chunk size
+  buffer.writeUInt16LE(1, 20);             // PCM format
+  buffer.writeUInt16LE(channels, 22);
+  buffer.writeUInt32LE(sampleRate, 24);
+  buffer.writeUInt32LE(byteRate, 28);
+  buffer.writeUInt16LE(blockAlign, 32);
+  buffer.writeUInt16LE(bitsPerSample, 34);
+
+  // data sub-chunk
+  buffer.write('data', 36);
+  buffer.writeUInt32LE(dataSize, 40);
+  pcmData.copy(buffer, headerSize);
+
+  return buffer;
+}
+
+/**
+ * Submit audio to Speechmatics batch API for transcription + sentiment + summary.
+ * @param {Buffer} wavBuffer - WAV audio buffer
+ * @returns {Promise<string>} job ID
+ */
+export async function submitBatchAnalysis(wavBuffer) {
+  const form = new FormData();
+
+  const config = {
+    type: 'transcription',
+    transcription_config: {
+      language: 'en',
+      operating_point: 'enhanced',
+      diarization: 'speaker',
+    },
+    sentiment_analysis_config: {},
+    summarization_config: {},
+  };
+
+  form.set('config', JSON.stringify(config));
+  form.set('data_file', new Blob([wavBuffer], { type: 'audio/wav' }), 'recording.wav');
+
+  const res = await fetch(`${BATCH_BASE_URL}/jobs/`, {
+    method: 'POST',
+    headers: { 'Authorization': `Bearer ${SPEECHMATICS_API_KEY}` },
+    body: form,
+  });
+
+  if (!res.ok) {
+    const errText = await res.text();
+    throw new Error(`Batch submit failed (${res.status}): ${errText}`);
+  }
+
+  const data = await res.json();
+  return data.id;
+}
+
+/**
+ * Poll a batch job until completion and return the full transcript result.
+ * @param {string} jobId
+ * @param {number} timeout - max wait in seconds
+ * @param {number} interval - poll interval in seconds
+ * @returns {Promise<Object>} full transcript JSON (includes sentiment_analysis, summary, etc.)
+ */
+export async function pollBatchJob(jobId, timeout = 120, interval = 3) {
+  const headers = { 'Authorization': `Bearer ${SPEECHMATICS_API_KEY}` };
+  const deadline = Date.now() + timeout * 1000;
+
+  while (Date.now() < deadline) {
+    const statusRes = await fetch(`${BATCH_BASE_URL}/jobs/${jobId}`, { headers });
+    if (!statusRes.ok) {
+      throw new Error(`Batch status check failed (${statusRes.status})`);
+    }
+
+    const statusData = await statusRes.json();
+    const jobStatus = statusData.job?.status;
+
+    if (jobStatus === 'done') {
+      // Fetch the full transcript
+      const transcriptRes = await fetch(
+        `${BATCH_BASE_URL}/jobs/${jobId}/transcript?format=json-v2`,
+        { headers },
+      );
+      if (!transcriptRes.ok) {
+        throw new Error(`Batch transcript fetch failed (${transcriptRes.status})`);
+      }
+      return transcriptRes.json();
+    }
+
+    if (jobStatus === 'rejected' || jobStatus === 'deleted') {
+      throw new Error(`Batch job ${jobStatus}: ${JSON.stringify(statusData)}`);
+    }
+
+    // Wait before polling again
+    await new Promise(r => setTimeout(r, interval * 1000));
+  }
+
+  throw new Error(`Batch job timed out after ${timeout}s`);
+}
+
 // ─── Audio Conversion ───────────────────────────────────────────
 
 export function pcm16kToMulaw8k(pcmBuffer) {
