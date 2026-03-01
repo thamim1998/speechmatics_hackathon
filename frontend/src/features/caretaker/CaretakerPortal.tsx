@@ -1,4 +1,5 @@
 
+
 import { useEffect, useMemo, useState, type FormEvent } from "react";
 import {
   BarChart,
@@ -20,6 +21,10 @@ import {
   type CaretakerEventType,
   type TimelineMessage,
 } from "./api/caretakerApi";
+
+import { collection, query, orderBy, limit, getDocs } from "firebase/firestore";
+import { jsPDF } from "jspdf";
+import { db } from "../../firebase";
 
 // ----------------------
 // Color coding
@@ -106,6 +111,34 @@ function inRange(iso: string, from?: string, to?: string) {
 }
 
 // ----------------------
+// Small UI helpers (TSX-only polish)
+// ----------------------
+function SectionBadge({ children }: { children: React.ReactNode }) {
+  return (
+    <span
+      className="card-number"
+      style={{
+        width: 34,
+        height: 34,
+        display: "inline-flex",
+        alignItems: "center",
+        justifyContent: "center",
+        borderRadius: 999,
+        background: "var(--color-cream)",
+        border: "1px solid var(--color-cream-dark)",
+        fontSize: 14,
+        fontWeight: 600,
+        lineHeight: 1,
+        opacity: 1,
+        flexShrink: 0,
+      }}
+    >
+      {children}
+    </span>
+  );
+}
+
+// ----------------------
 // Component
 // ----------------------
 export default function CaretakerPortal() {
@@ -138,10 +171,195 @@ export default function CaretakerPortal() {
   const [medTaken, setMedTaken] = useState(true);
   const [medNote, setMedNote] = useState("");
 
+  // profile fields (stable facts -> backend builds/uploads document)
+  const [profilePatientName, setProfilePatientName] = useState("");
+  const [profileDiagnosis, setProfileDiagnosis] = useState("");
+  const [profileMedicationPlan, setProfileMedicationPlan] = useState("");
+  const [profileRoutine, setProfileRoutine] = useState("");
+  const [profileEmergencyContact, setProfileEmergencyContact] = useState("");
+  const [profileCalmingStrategies, setProfileCalmingStrategies] = useState("");
+
   // timeline filters
   const [filterType, setFilterType] = useState<string>("all");
   const [fromDay, setFromDay] = useState<string>("");
   const [toDay, setToDay] = useState<string>("");
+
+  // report download
+  const [downloading, setDownloading] = useState(false);
+
+  const handleDownload = async () => {
+    setDownloading(true);
+    try {
+      const q = query(collection(db, "call_transcripts"), orderBy("createdAt", "desc"), limit(2));
+      const snapshot = await getDocs(q);
+
+      if (snapshot.empty) {
+        alert("No conversations found.");
+        return;
+      }
+
+      const docs: Record<string, any>[] = [];
+      snapshot.forEach((doc) => docs.push({ id: doc.id, ...doc.data() }));
+
+      const pdf = new jsPDF({ unit: "mm", format: "a4" });
+      const W = pdf.internal.pageSize.getWidth();
+      const H = pdf.internal.pageSize.getHeight();
+      const margin = 20;
+      const contentW = W - margin * 2;
+      let y = 0;
+
+      const ensureSpace = (needed: number) => {
+        if (y + needed > H - margin) {
+          pdf.addPage();
+          y = margin;
+        }
+      };
+
+      // Header
+      pdf.setFillColor(45, 74, 62);
+      pdf.rect(0, 0, W, 52, "F");
+      pdf.setFillColor(196, 114, 78);
+      pdf.rect(0, 52, W, 2, "F");
+
+      pdf.setFont("helvetica", "bold");
+      pdf.setFontSize(22);
+      pdf.setTextColor(255, 255, 255);
+      pdf.text("Conversation Transcripts", margin, 26);
+
+      pdf.setFont("helvetica", "normal");
+      pdf.setFontSize(10);
+      pdf.setTextColor(200, 210, 200);
+      const dateStr = new Date().toLocaleDateString("en-GB", {
+        day: "numeric",
+        month: "long",
+        year: "numeric",
+      });
+      pdf.text(
+        `${dateStr}  •  ${docs.length} conversation${docs.length !== 1 ? "s" : ""}`,
+        margin,
+        38,
+      );
+
+      y = 66;
+
+      docs.forEach((doc: Record<string, any>, docIdx: number) => {
+        ensureSpace(25);
+
+        // Conversation header
+        pdf.setFillColor(245, 243, 240);
+        pdf.roundedRect(margin, y - 3, contentW, 14, 3, 3, "F");
+        pdf.setFillColor(196, 114, 78);
+        pdf.roundedRect(margin, y - 3, 3, 14, 1.5, 1.5, "F");
+
+        pdf.setFont("helvetica", "bold");
+        pdf.setFontSize(12);
+        pdf.setTextColor(45, 74, 62);
+        pdf.text(`Conversation ${docIdx + 1}`, margin + 8, y + 6);
+
+        // Timestamp
+        const raw = doc.createdAt as
+          | { toDate?: () => Date; seconds?: number }
+          | string
+          | undefined;
+
+        const ts =
+          raw &&
+          typeof raw === "object" &&
+          "toDate" in raw &&
+          typeof raw.toDate === "function"
+            ? raw.toDate()
+            : raw &&
+              typeof raw === "object" &&
+              "seconds" in raw &&
+              typeof raw.seconds === "number"
+              ? new Date(raw.seconds * 1000)
+              : raw
+              ? new Date(raw as string)
+              : null;
+
+        if (ts) {
+          pdf.setFont("helvetica", "normal");
+          pdf.setFontSize(8);
+          pdf.setTextColor(150, 140, 130);
+          pdf.text(
+            ts.toLocaleString("en-GB", {
+              day: "numeric",
+              month: "short",
+              year: "numeric",
+              hour: "2-digit",
+              minute: "2-digit",
+            }),
+            W - margin,
+            y + 6,
+            { align: "right" },
+          );
+        }
+
+        y += 18;
+
+        // Messages
+        const messages = (doc.messages || doc.transcript || []) as {
+          role?: string;
+          speaker?: string;
+          content?: string;
+          text?: string;
+        }[];
+
+        messages.forEach((msg) => {
+          ensureSpace(16);
+          const role = msg.role || msg.speaker || "unknown";
+          const text = msg.content || msg.text || "";
+          const isUser = role === "user" || role === "caller";
+
+          // Label
+          pdf.setFont("helvetica", "bold");
+          pdf.setFontSize(7.5);
+          pdf.setTextColor(isUser ? 130 : 45, isUser ? 120 : 74, isUser ? 110 : 62);
+          pdf.text(isUser ? "CALLER" : "COUNSELLOR", margin + 2, y);
+          y += 5;
+
+          // Bubble
+          const lines = pdf
+            .setFont("helvetica", "normal")
+            .setFontSize(10)
+            .splitTextToSize(text, contentW - 14);
+
+          const blockH = lines.length * 5 + 7;
+          ensureSpace(blockH + 4);
+
+          pdf.setFillColor(isUser ? 250 : 240, isUser ? 248 : 247, isUser ? 245 : 245);
+          pdf.setDrawColor(isUser ? 230 : 200, isUser ? 225 : 220, isUser ? 220 : 210);
+          pdf.roundedRect(margin, y - 3, contentW, blockH, 2.5, 2.5, "FD");
+
+          pdf.setTextColor(60, 55, 50);
+          pdf.text(lines, margin + 7, y + 3.5);
+          y += blockH + 5;
+        });
+
+        if (docIdx < docs.length - 1) {
+          y += 6;
+          ensureSpace(8);
+          pdf.setDrawColor(220, 215, 210);
+          pdf.setLineWidth(0.3);
+          pdf.line(margin + 30, y, W - margin - 30, y);
+          y += 10;
+        }
+      });
+
+      // Footer
+      pdf.setFont("helvetica", "normal");
+      pdf.setFontSize(7);
+      pdf.setTextColor(160, 155, 150);
+      pdf.text("AI Counsellor  •  Confidential", W / 2, H - 10, { align: "center" });
+
+      pdf.save("conversation-transcripts.pdf");
+    } catch (err) {
+      console.error("Download failed:", err);
+      alert("Failed to download transcripts. Check console for details.");
+    } finally {
+      setDownloading(false);
+    }
+  };
 
   async function refresh() {
     setLoading(true);
@@ -184,7 +402,8 @@ export default function CaretakerPortal() {
           wakeUps: Number(sleepWakeUps),
           quality: Number(sleepQuality),
         };
-        if (!body.text) body.text = `Sleep: ${sleepDuration} min, wakeUps ${sleepWakeUps}, quality ${sleepQuality}/5`;
+        if (!body.text)
+          body.text = `Sleep: ${sleepDuration} min, wakeUps ${sleepWakeUps}, quality ${sleepQuality}/5`;
       }
 
       if (type === "mood") {
@@ -198,7 +417,8 @@ export default function CaretakerPortal() {
           severity: Number(incidentSeverity),
           description: incidentDesc.trim() || undefined,
         };
-        if (!body.text) body.text = `Incident: ${incidentType} (severity ${incidentSeverity}/5)`;
+        if (!body.text)
+          body.text = `Incident: ${incidentType} (severity ${incidentSeverity}/5)`;
       }
 
       if (type === "medication") {
@@ -208,15 +428,39 @@ export default function CaretakerPortal() {
           taken: Boolean(medTaken),
           note: medNote.trim() || undefined,
         };
-        if (!body.text) body.text = `Medication: ${medName || "Unknown"} (${medTaken ? "taken" : "missed"})`;
+        if (!body.text)
+          body.text = `Medication: ${medName || "Unknown"} (${medTaken ? "taken" : "missed"})`;
+      }
+
+      // ✅ NEW: profile (stable facts -> backend document upload)
+      if (type === "profile") {
+        body.data = {
+          patientName: profilePatientName.trim() || undefined,
+          diagnosis: profileDiagnosis.trim() || undefined,
+          medicationPlan: profileMedicationPlan.trim() || undefined,
+          baselineRoutine: profileRoutine.trim() || undefined,
+          emergencyContact: profileEmergencyContact.trim() || undefined,
+          calmingStrategies: profileCalmingStrategies.trim() || undefined,
+        };
+        if (!body.text) body.text = "Profile updated by caretaker.";
       }
 
       await addEvent(body);
 
-      // reset some fields
+      // reset generic fields
       setText("");
       setIncidentDesc("");
       setMedNote("");
+
+      // optional: reset profile fields on save
+      if (type === "profile") {
+        setProfilePatientName("");
+        setProfileDiagnosis("");
+        setProfileMedicationPlan("");
+        setProfileRoutine("");
+        setProfileEmergencyContact("");
+        setProfileCalmingStrategies("");
+      }
 
       await refresh();
     } catch (e2: any) {
@@ -256,7 +500,6 @@ export default function CaretakerPortal() {
     const countsByType: Record<string, number> = summary.countsByType || {};
     const avgSleepByDay: Record<string, number> = summary.avgSleepMinutesByDay || {};
     const incidentCountsByType: Record<string, number> = summary.incidentCountsByType || {};
-    const delta: Record<string, number> = summary.delta7DaysByType || {};
     const last7 = summary.last7Days?.countsByType || {};
     const prev7 = summary.prev7Days?.countsByType || {};
     const flags: string[] = summary.flags || [];
@@ -280,7 +523,6 @@ export default function CaretakerPortal() {
         type,
         last7: last7[type] ?? 0,
         prev7: prev7[type] ?? 0,
-        delta: delta[type] ?? 0,
       }));
 
     const totalEntries = Object.values(countsByType).reduce((a, b) => a + b, 0);
@@ -297,7 +539,7 @@ export default function CaretakerPortal() {
     return (
       <section className="form-card" style={{ animationDelay: "0.2s" }}>
         <div className="card-header">
-          <span className="card-number">A</span>
+          <SectionBadge>A</SectionBadge>
           <div>
             <h2 className="card-title">Analytics</h2>
             <p className="card-description">Figures and charts</p>
@@ -305,14 +547,19 @@ export default function CaretakerPortal() {
         </div>
 
         <div style={{ padding: 16, display: "grid", gap: 16 }}>
-          {/* Number cards */}
-          <div style={{ display: "grid", gridTemplateColumns: "repeat(3, minmax(0, 1fr))", gap: 12 }}>
+          {/* TSX-only responsive KPI grid */}
+          <div
+            style={{
+              display: "grid",
+              gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))",
+              gap: 12,
+            }}
+          >
             <Card title="Total entries" value={String(totalEntries)} />
             <Card title="Incidents (total)" value={String(totalIncidents)} />
             <Card title="Latest sleep (min)" value={latestSleep != null ? String(latestSleep) : "—"} />
           </div>
 
-          {/* Counts by type (color-coded by type) */}
           <div style={{ border: "1px solid #eee", borderRadius: 10, padding: 12 }}>
             <div style={{ fontWeight: 800, marginBottom: 8 }}>Counts by type</div>
             <div style={{ height: 220 }}>
@@ -332,7 +579,6 @@ export default function CaretakerPortal() {
             </div>
           </div>
 
-          {/* Avg sleep (blue line) */}
           <div style={{ border: "1px solid #eee", borderRadius: 10, padding: 12 }}>
             <div style={{ fontWeight: 800, marginBottom: 8 }}>Avg sleep minutes by day</div>
             <div style={{ height: 240 }}>
@@ -349,7 +595,6 @@ export default function CaretakerPortal() {
             </div>
           </div>
 
-          {/* Last 7 vs prev 7 (series-colored) */}
           <div style={{ border: "1px solid #eee", borderRadius: 10, padding: 12 }}>
             <div style={{ fontWeight: 800, marginBottom: 8 }}>Last 7 days vs previous 7 days</div>
             <div style={{ height: 240 }}>
@@ -366,7 +611,6 @@ export default function CaretakerPortal() {
             </div>
           </div>
 
-          {/* Top incident types (orange) */}
           <div style={{ border: "1px solid #eee", borderRadius: 10, padding: 12 }}>
             <div style={{ fontWeight: 800, marginBottom: 8 }}>Top incident types</div>
             <div style={{ height: 220 }}>
@@ -382,7 +626,6 @@ export default function CaretakerPortal() {
             </div>
           </div>
 
-          {/* Flags */}
           <div style={{ border: "1px solid #eee", borderRadius: 10, padding: 12 }}>
             <div style={{ fontWeight: 800, marginBottom: 8 }}>Flags</div>
             {flags.length ? (
@@ -407,10 +650,34 @@ export default function CaretakerPortal() {
         <h1 className="page-title">Caretaker Portal</h1>
         <p className="page-subtitle">Add context and review the patient timeline</p>
 
-        <div style={{ marginTop: 8 }}>
+        {/* link on top, download button below */}
+        <div
+          style={{
+            marginTop: 20,
+            display: "flex",
+            flexDirection: "column",
+            alignItems: "center",
+            gap: 12,
+          }}
+        >
           <a href="/" style={{ fontSize: 12, opacity: 0.8 }}>
             ← Back to patient portal
           </a>
+
+          <button
+            type="button"
+            className="btn-download"
+            onClick={handleDownload}
+            disabled={downloading}
+            style={{
+              minWidth: 260,
+              whiteSpace: "nowrap",
+            }}
+          >
+            <span style={{ display: "inline-block", minWidth: 175, textAlign: "center" }}>
+              {downloading ? "Downloading..." : "Download Transcripts"}
+            </span>
+          </button>
         </div>
       </header>
 
@@ -423,7 +690,7 @@ export default function CaretakerPortal() {
       {/* Add Entry */}
       <section className="form-card" style={{ animationDelay: "0.1s" }}>
         <div className="card-header">
-          <span className="card-number">01</span>
+          <SectionBadge>01</SectionBadge>
           <div>
             <h2 className="card-title">Add Entry</h2>
             <p className="card-description">Store caretaker observations in Backboard</p>
@@ -435,7 +702,11 @@ export default function CaretakerPortal() {
             <div className="form-group">
               <label className="form-label">Type</label>
               <div className="select-wrapper">
-                <select className="form-select" value={type} onChange={(e) => setType(e.target.value as CaretakerEventType)}>
+                <select
+                  className="form-select"
+                  value={type}
+                  onChange={(e) => setType(e.target.value as CaretakerEventType)}
+                >
                   <option value="note">note</option>
                   <option value="sleep">sleep</option>
                   <option value="mood">mood</option>
@@ -449,6 +720,7 @@ export default function CaretakerPortal() {
               </div>
             </div>
 
+            {/* Free text stays available for all types */}
             <div className="form-group">
               <label className="form-label">Text (optional)</label>
               <textarea
@@ -465,15 +737,32 @@ export default function CaretakerPortal() {
               <>
                 <div className="form-group">
                   <label className="form-label">Duration (minutes)</label>
-                  <input className="form-input" type="number" value={sleepDuration} onChange={(e) => setSleepDuration(Number(e.target.value))} />
+                  <input
+                    className="form-input"
+                    type="number"
+                    value={sleepDuration}
+                    onChange={(e) => setSleepDuration(Number(e.target.value))}
+                  />
                 </div>
                 <div className="form-group">
                   <label className="form-label">Wake ups</label>
-                  <input className="form-input" type="number" value={sleepWakeUps} onChange={(e) => setSleepWakeUps(Number(e.target.value))} />
+                  <input
+                    className="form-input"
+                    type="number"
+                    value={sleepWakeUps}
+                    onChange={(e) => setSleepWakeUps(Number(e.target.value))}
+                  />
                 </div>
                 <div className="form-group">
                   <label className="form-label">Quality (1–5)</label>
-                  <input className="form-input" type="number" min={1} max={5} value={sleepQuality} onChange={(e) => setSleepQuality(Number(e.target.value))} />
+                  <input
+                    className="form-input"
+                    type="number"
+                    min={1}
+                    max={5}
+                    value={sleepQuality}
+                    onChange={(e) => setSleepQuality(Number(e.target.value))}
+                  />
                 </div>
               </>
             ) : null}
@@ -484,7 +773,11 @@ export default function CaretakerPortal() {
                 <div className="form-group">
                   <label className="form-label">Mood</label>
                   <div className="select-wrapper">
-                    <select className="form-select" value={moodLabel} onChange={(e) => setMoodLabel(e.target.value as MoodLabel)}>
+                    <select
+                      className="form-select"
+                      value={moodLabel}
+                      onChange={(e) => setMoodLabel(e.target.value as MoodLabel)}
+                    >
                       <option value="calm">calm</option>
                       <option value="anxious">anxious</option>
                       <option value="agitated">agitated</option>
@@ -496,7 +789,14 @@ export default function CaretakerPortal() {
                 </div>
                 <div className="form-group">
                   <label className="form-label">Severity (1–5)</label>
-                  <input className="form-input" type="number" min={1} max={5} value={moodSeverity} onChange={(e) => setMoodSeverity(Number(e.target.value))} />
+                  <input
+                    className="form-input"
+                    type="number"
+                    min={1}
+                    max={5}
+                    value={moodSeverity}
+                    onChange={(e) => setMoodSeverity(Number(e.target.value))}
+                  />
                 </div>
               </>
             ) : null}
@@ -507,7 +807,11 @@ export default function CaretakerPortal() {
                 <div className="form-group">
                   <label className="form-label">Incident type</label>
                   <div className="select-wrapper">
-                    <select className="form-select" value={incidentType} onChange={(e) => setIncidentType(e.target.value as IncidentType)}>
+                    <select
+                      className="form-select"
+                      value={incidentType}
+                      onChange={(e) => setIncidentType(e.target.value as IncidentType)}
+                    >
                       <option value="wandering">wandering</option>
                       <option value="fall">fall</option>
                       <option value="agitation">agitation</option>
@@ -520,11 +824,23 @@ export default function CaretakerPortal() {
                 </div>
                 <div className="form-group">
                   <label className="form-label">Severity (1–5)</label>
-                  <input className="form-input" type="number" min={1} max={5} value={incidentSeverity} onChange={(e) => setIncidentSeverity(Number(e.target.value))} />
+                  <input
+                    className="form-input"
+                    type="number"
+                    min={1}
+                    max={5}
+                    value={incidentSeverity}
+                    onChange={(e) => setIncidentSeverity(Number(e.target.value))}
+                  />
                 </div>
                 <div className="form-group">
                   <label className="form-label">Description (optional)</label>
-                  <input className="form-input" value={incidentDesc} onChange={(e) => setIncidentDesc(e.target.value)} placeholder="What happened?" />
+                  <input
+                    className="form-input"
+                    value={incidentDesc}
+                    onChange={(e) => setIncidentDesc(e.target.value)}
+                    placeholder="What happened?"
+                  />
                 </div>
               </>
             ) : null}
@@ -534,16 +850,30 @@ export default function CaretakerPortal() {
               <>
                 <div className="form-group">
                   <label className="form-label">Medication name</label>
-                  <input className="form-input" value={medName} onChange={(e) => setMedName(e.target.value)} placeholder="e.g., Donepezil" />
+                  <input
+                    className="form-input"
+                    value={medName}
+                    onChange={(e) => setMedName(e.target.value)}
+                    placeholder="e.g., Donepezil"
+                  />
                 </div>
                 <div className="form-group">
                   <label className="form-label">Dose (optional)</label>
-                  <input className="form-input" value={medDose} onChange={(e) => setMedDose(e.target.value)} placeholder="e.g., 5mg" />
+                  <input
+                    className="form-input"
+                    value={medDose}
+                    onChange={(e) => setMedDose(e.target.value)}
+                    placeholder="e.g., 5mg"
+                  />
                 </div>
                 <div className="form-group">
                   <label className="form-label">Taken?</label>
                   <div className="select-wrapper">
-                    <select className="form-select" value={medTaken ? "yes" : "no"} onChange={(e) => setMedTaken(e.target.value === "yes")}>
+                    <select
+                      className="form-select"
+                      value={medTaken ? "yes" : "no"}
+                      onChange={(e) => setMedTaken(e.target.value === "yes")}
+                    >
                       <option value="yes">yes</option>
                       <option value="no">no</option>
                     </select>
@@ -554,7 +884,79 @@ export default function CaretakerPortal() {
                 </div>
                 <div className="form-group">
                   <label className="form-label">Note (optional)</label>
-                  <input className="form-input" value={medNote} onChange={(e) => setMedNote(e.target.value)} placeholder="e.g., after breakfast" />
+                  <input
+                    className="form-input"
+                    value={medNote}
+                    onChange={(e) => setMedNote(e.target.value)}
+                    placeholder="e.g., after breakfast"
+                  />
+                </div>
+              </>
+            ) : null}
+
+            {/* ✅ NEW: profile fields */}
+            {type === "profile" ? (
+              <>
+                <div className="form-group">
+                  <label className="form-label">Patient name</label>
+                  <input
+                    className="form-input"
+                    value={profilePatientName}
+                    onChange={(e) => setProfilePatientName(e.target.value)}
+                    placeholder="e.g., John Doe"
+                  />
+                </div>
+
+                <div className="form-group">
+                  <label className="form-label">Diagnosis</label>
+                  <input
+                    className="form-input"
+                    value={profileDiagnosis}
+                    onChange={(e) => setProfileDiagnosis(e.target.value)}
+                    placeholder="e.g., Dementia"
+                  />
+                </div>
+
+                <div className="form-group">
+                  <label className="form-label">Medication plan</label>
+                  <input
+                    className="form-input"
+                    value={profileMedicationPlan}
+                    onChange={(e) => setProfileMedicationPlan(e.target.value)}
+                    placeholder="e.g., Donepezil 5mg daily after breakfast"
+                  />
+                </div>
+
+                <div className="form-group">
+                  <label className="form-label">Baseline routine</label>
+                  <textarea
+                    className="form-input"
+                    style={{ minHeight: 90 }}
+                    value={profileRoutine}
+                    onChange={(e) => setProfileRoutine(e.target.value)}
+                    placeholder="Breakfast time, walk, lunch, rest..."
+                  />
+                </div>
+
+                <div className="form-group">
+                  <label className="form-label">Emergency contact</label>
+                  <input
+                    className="form-input"
+                    value={profileEmergencyContact}
+                    onChange={(e) => setProfileEmergencyContact(e.target.value)}
+                    placeholder="Name + phone"
+                  />
+                </div>
+
+                <div className="form-group">
+                  <label className="form-label">Calming strategies</label>
+                  <textarea
+                    className="form-input"
+                    style={{ minHeight: 90 }}
+                    value={profileCalmingStrategies}
+                    onChange={(e) => setProfileCalmingStrategies(e.target.value)}
+                    placeholder="What helps when the patient is anxious/confused?"
+                  />
                 </div>
               </>
             ) : null}
@@ -563,21 +965,17 @@ export default function CaretakerPortal() {
           <div className="form-actions" style={{ marginTop: 12 }}>
             <button type="submit" className="btn btn-primary btn-large">
               Save Entry
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="20" height="20">
-                <path d="M5 12h14M12 5l7 7-7 7" />
-              </svg>
             </button>
           </div>
         </form>
       </section>
 
-      {/* Analytics */}
       {analyticsCharts}
 
       {/* Timeline */}
       <section className="form-card" style={{ animationDelay: "0.3s" }}>
         <div className="card-header">
-          <span className="card-number">02</span>
+          <SectionBadge>02</SectionBadge>
           <div>
             <h2 className="card-title">Timeline</h2>
             <p className="card-description">Filter and review entries</p>
@@ -623,9 +1021,7 @@ export default function CaretakerPortal() {
             <div style={{ display: "grid", gap: 14 }}>
               {grouped.map(({ day, items }) => (
                 <div key={day}>
-                  <div style={{ fontWeight: 800, marginBottom: 8 }}>
-                    {formatDateLabel(day)}
-                  </div>
+                  <div style={{ fontWeight: 800, marginBottom: 8 }}>{formatDateLabel(day)}</div>
 
                   <ul className="questions-list">
                     {items.map((m) => {
@@ -634,12 +1030,12 @@ export default function CaretakerPortal() {
                       const t = getType(m);
                       return (
                         <li key={m.message_id} className="question-item" style={{ alignItems: "flex-start" }}>
-                          <span className="question-number">
+                          <span className="question-number" style={{ lineHeight: "28px", fontVariantNumeric: "tabular-nums" }}>
                             {t.slice(0, 1).toUpperCase()}
                           </span>
 
                           <div style={{ flex: 1 }}>
-                            <div style={{ display: "flex", justifyContent: "space-between", gap: 12 }}>
+                            <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "baseline" }}>
                               <span className="question-text" style={{ fontWeight: 700 }}>
                                 <span
                                   style={{
@@ -654,9 +1050,7 @@ export default function CaretakerPortal() {
                                 />
                                 {t}
                               </span>
-                              <span style={{ opacity: 0.7, fontSize: 12 }}>
-                                {iso ? timeFromISO(iso) : ""}
-                              </span>
+                              <span style={{ opacity: 0.7, fontSize: 12 }}>{iso ? timeFromISO(iso) : ""}</span>
                             </div>
 
                             <div style={{ marginTop: 6 }}>{m.content}</div>

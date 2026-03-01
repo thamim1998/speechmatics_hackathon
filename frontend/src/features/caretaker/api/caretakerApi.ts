@@ -6,6 +6,8 @@
  *   /api/caretaker/analytics/summary
  */
 
+
+
 const SECRET = import.meta.env.VITE_CARETAKER_SECRET as string | undefined;
 
 /**
