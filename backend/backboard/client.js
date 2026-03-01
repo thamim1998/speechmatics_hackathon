@@ -80,4 +80,82 @@ export class BackboardClient {
     mustOk(res, text);
     return JSON.parse(text);
   }
+
+  // ─── Memory management ─────────────────────────────────────────
+
+  async listMemories(assistantId) {
+    const res = await fetch(`${BASE_URL}/assistants/${assistantId}/memories`, {
+      headers: this.authHeaders(),
+    });
+    const text = await res.text();
+    mustOk(res, text);
+    const data = JSON.parse(text);
+    return data.memories || [];
+  }
+
+  async deleteMemory(assistantId, memoryId) {
+    const res = await fetch(`${BASE_URL}/assistants/${assistantId}/memories/${memoryId}`, {
+      method: 'DELETE',
+      headers: this.authHeaders(),
+    });
+    const text = await res.text();
+    mustOk(res, text);
+  }
+
+  // ─── Thread management ─────────────────────────────────────────
+
+  async listThreads(assistantId) {
+    const res = await fetch(`${BASE_URL}/assistants/${assistantId}/threads`, {
+      headers: this.authHeaders(),
+    });
+    const text = await res.text();
+    mustOk(res, text);
+    const data = JSON.parse(text);
+    const threads = data.threads || data;
+    return Array.isArray(threads) ? threads : [];
+  }
+
+  async deleteThread(threadId) {
+    const res = await fetch(`${BASE_URL}/threads/${threadId}`, {
+      method: 'DELETE',
+      headers: this.authHeaders(),
+    });
+    const text = await res.text();
+    mustOk(res, text);
+  }
+
+  // ─── Document management ───────────────────────────────────────
+
+  async listDocuments(assistantId) {
+    const res = await fetch(`${BASE_URL}/assistants/${assistantId}/documents`, {
+      headers: this.authHeaders(),
+    });
+    const text = await res.text();
+    mustOk(res, text);
+    const data = JSON.parse(text);
+    return Array.isArray(data) ? data : [];
+  }
+
+  async deleteDocument(assistantId, documentId) {
+    const res = await fetch(`${BASE_URL}/assistants/${assistantId}/documents/${documentId}`, {
+      method: 'DELETE',
+      headers: this.authHeaders(),
+    });
+    const text = await res.text();
+    mustOk(res, text);
+  }
+
+  async uploadDocument(assistantId, filename, buffer, mimeType = 'text/markdown') {
+    const form = new FormData();
+    form.set('file', new Blob([buffer], { type: mimeType }), filename);
+
+    const res = await fetch(`${BASE_URL}/assistants/${assistantId}/documents`, {
+      method: 'POST',
+      headers: this.authHeaders(),
+      body: form,
+    });
+    const text = await res.text();
+    mustOk(res, text);
+    return JSON.parse(text);
+  }
 }
