@@ -37,6 +37,47 @@
   font-weight: 300;
 }
 
+/* ─── Download Button ────────────────────────── */
+
+.btn-download {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  margin-top: 20px;
+  padding: 12px 28px;
+  font-family: var(--font-body);
+  font-size: 0.9rem;
+  font-weight: 500;
+  color: var(--color-forest);
+  background: var(--color-white);
+  border: 1.5px solid var(--color-border);
+  border-radius: 12px;
+  cursor: pointer;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.04);
+  transition: all 0.2s ease;
+}
+
+.btn-download:hover:not(:disabled) {
+  border-color: var(--color-forest);
+  background: var(--color-cream);
+  box-shadow: 0 3px 12px rgba(45, 74, 62, 0.1);
+  transform: translateY(-1px);
+}
+
+.btn-download:active:not(:disabled) {
+  transform: translateY(0);
+}
+
+.btn-download:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.btn-download .spinner {
+  animation: spin 1s linear infinite;
+}
+
 /* ─── Cards ──────────────────────────────────── */
 
 .form-card {

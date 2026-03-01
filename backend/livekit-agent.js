@@ -6,7 +6,7 @@
  *
  * Pipeline:
  *   LiveKit AudioStream (PCM 16kHz) → Speechmatics STT (real-time)
- *     → 0.7s silence timeout → Claude (streaming)
+ *     → 0.5s silence timeout → Claude (streaming)
  *     → sentence-by-sentence Speechmatics TTS → LiveKit AudioSource
  *
  * Usage:
@@ -45,8 +45,18 @@ const {
 
 const PHONE_NUMBER = process.argv[2];
 const ROOM_NAME = `call-${Date.now()}`;
-const UTTERANCE_SILENCE_MS = 500; // 0.5s silence triggers response
+const SILENCE_MS_SHORT = 300;    // used when utterance looks complete
+const SILENCE_MS_DEFAULT = 500;  // used when user might still be talking
 const AGENT_SAMPLE_RATE = 16000; // matches Speechmatics TTS output
+
+/** Short timeout if >3 words and ends cleanly; default otherwise */
+function getSilenceTimeout(text) {
+  const trimmed = text.trim();
+  const words = trimmed.split(/\s+/);
+  if (words.length > 3 && /[.!?,;:]$/.test(trimmed)) return SILENCE_MS_SHORT;
+  if (words.length > 3 && /\w$/.test(trimmed)) return SILENCE_MS_SHORT;
+  return SILENCE_MS_DEFAULT;
+}
 
 if (!PHONE_NUMBER) {
   console.error('Usage: node livekit-agent.js <+phoneNumber>');
@@ -63,12 +73,96 @@ if (!SPEECHMATICS_API_KEY) {
   process.exit(1);
 }
 
+// ─── AudioPlayer (20ms real-time pacing) ──────────────────────
+const FRAME_DURATION_MS = 20;
+const SAMPLES_PER_FRAME = (AGENT_SAMPLE_RATE * FRAME_DURATION_MS) / 1000; // 320
+
+class AudioPlayer {
+  constructor(source) {
+    this._source = source;
+    this._queue = [];       // array of Int16Array chunks
+    this._draining = false;
+    this._stopped = false;
+    this._doneResolvers = [];
+  }
+
+  isPlaying() { return this._draining; }
+
+  stopNow() {
+    this._stopped = true;
+    this._queue.length = 0;
+    // Resolve all waiters immediately so pipeline unblocks
+    for (const resolve of this._doneResolvers) resolve();
+    this._doneResolvers = [];
+  }
+
+  /** Non-blocking — adds PCM buffer to the playback queue */
+  enqueue(pcmBuffer) {
+    const int16 = new Int16Array(
+      pcmBuffer.buffer,
+      pcmBuffer.byteOffset,
+      pcmBuffer.length / 2,
+    );
+    // Slice into 20ms frames
+    for (let off = 0; off < int16.length; off += SAMPLES_PER_FRAME) {
+      const end = Math.min(off + SAMPLES_PER_FRAME, int16.length);
+      this._queue.push(int16.slice(off, end));
+    }
+    if (!this._draining) this._drain();
+  }
+
+  /** Resolves when all queued audio has been sent */
+  waitUntilDone() {
+    if (this._queue.length === 0 && !this._draining) {
+      return Promise.resolve();
+    }
+    return new Promise(resolve => this._doneResolvers.push(resolve));
+  }
+
+  async _drain() {
+    this._draining = true;
+    this._stopped = false;
+    const startTime = performance.now();
+    let framesSent = 0;
+
+    while (this._queue.length > 0 && !this._stopped) {
+      const samples = this._queue.shift();
+      const frame = new AudioFrame(samples, AGENT_SAMPLE_RATE, 1, samples.length);
+      await this._source.captureFrame(frame);
+      framesSent++;
+
+      // Clock-based pacing: sleep until the next frame boundary
+      const elapsed = performance.now() - startTime;
+      const targetTime = framesSent * FRAME_DURATION_MS;
+      const sleepMs = targetTime - elapsed;
+      if (sleepMs > 1) {
+        await new Promise(r => setTimeout(r, sleepMs));
+      }
+    }
+
+    this._draining = false;
+    // Notify all waiters
+    for (const resolve of this._doneResolvers) resolve();
+    this._doneResolvers = [];
+  }
+}
+
 // ─── Session State ─────────────────────────────────────────────
 let messages = [];           // Claude conversation history [{role, content}]
 let currentUtterance = '';   // Confirmed finals accumulated
 let partialUtterance = '';   // Latest partial (tentative)
 let isProcessing = false;    // Guard against concurrent responses
 let utteranceTimer = null;
+let generationId = 0;        // Incremented on barge-in to invalidate stale TTS
+
+// ─── Latency Tracking ─────────────────────────────────────────
+let t_lastAudioPacket = 0;  // timestamp of last audio packet from user
+
+function ms() { return performance.now(); }
+
+function logLatency(label, t0, t1) {
+  console.log(`  ⏱  ${label}: ${(t1 - t0).toFixed(0)}ms`);
+}
 
 // ─── Helpers ───────────────────────────────────────────────────
 
@@ -113,41 +207,73 @@ async function connectSTTForLiveKit(client) {
   console.log('[stt] Connected to Speechmatics (PCM s16le, 16kHz)');
 }
 
-// ─── Audio I/O ─────────────────────────────────────────────────
+// ─── TTS Phrase Cache ─────────────────────────────────────────
+const ttsCache = new Map();
 
-/**
- * Send PCM 16kHz audio buffer to LiveKit via AudioSource.
- * LiveKit buffers and plays audio at the correct rate internally.
- * No need to wait — captureFrame queues the audio for playback.
- */
-async function sendPcmToLiveKit(source, pcmBuffer) {
-  const int16Data = new Int16Array(
-    pcmBuffer.buffer,
-    pcmBuffer.byteOffset,
-    pcmBuffer.length / 2,
+const BRIDGE_FILLERS = ["Mm-hm.", "Okay.", "Right."];
+
+const CACHE_WARMUP_PHRASES = [
+  GREETING,
+  ...BRIDGE_FILLERS,
+  "I hear you.",
+  "That sounds really difficult.",
+  "Tell me more about that.",
+  "How does that make you feel?",
+  "Take your time.",
+  "I'm here for you.",
+  "That makes sense.",
+  "I understand.",
+  "Thank you for sharing that.",
+];
+
+let bridgeIndex = 0;
+
+async function cachedSynthesizeSpeech(text) {
+  const key = text.toLowerCase().trim();
+  if (ttsCache.has(key)) {
+    console.log(`  ⚡ TTS cache hit: "${text.slice(0, 40)}..."`);
+    return ttsCache.get(key);
+  }
+  const pcm = await synthesizeSpeech(text);
+  ttsCache.set(key, pcm);
+  return pcm;
+}
+
+async function warmTtsCache() {
+  console.log(`[cache] Pre-warming TTS cache with ${CACHE_WARMUP_PHRASES.length} phrases...`);
+  const t0 = ms();
+  const results = await Promise.allSettled(
+    CACHE_WARMUP_PHRASES.map(async (phrase) => {
+      const pcm = await synthesizeSpeech(phrase);
+      ttsCache.set(phrase.toLowerCase().trim(), pcm);
+    }),
   );
-
-  const frame = new AudioFrame(int16Data, AGENT_SAMPLE_RATE, 1, int16Data.length);
-  await source.captureFrame(frame);
+  const hits = results.filter(r => r.status === 'fulfilled').length;
+  logLatency(`Cache warmup (${hits}/${CACHE_WARMUP_PHRASES.length} phrases)`, t0, ms());
 }
 
 // ─── Voice Pipeline ────────────────────────────────────────────
 
-async function playGreeting(agentSource) {
+async function playGreeting(player) {
   console.log('[pipeline] Playing greeting');
   messages.push({ role: 'assistant', content: GREETING });
 
   try {
-    const pcmAudio = await synthesizeSpeech(GREETING);
+    const t0 = ms();
+    const pcmAudio = await cachedSynthesizeSpeech(GREETING);
+    const t1 = ms();
+    logLatency('Greeting TTS', t0, t1);
     console.log(`[pipeline] Greeting TTS returned ${pcmAudio.length} bytes (${(pcmAudio.length / 2 / AGENT_SAMPLE_RATE).toFixed(1)}s)`);
-    await sendPcmToLiveKit(agentSource, pcmAudio);
+    player.enqueue(pcmAudio);
+    logLatency('Greeting enqueue', t1, ms());
+    await player.waitUntilDone();
     console.log('[pipeline] Greeting played');
   } catch (err) {
     console.error('[pipeline] Greeting TTS failed:', err.message);
   }
 }
 
-async function handleEndOfUtterance(agentSource) {
+async function handleEndOfUtterance(player) {
   if (isProcessing) return;
 
   const userText = currentUtterance.trim();
@@ -157,59 +283,102 @@ async function handleEndOfUtterance(agentSource) {
   currentUtterance = '';
   partialUtterance = '';
 
-  console.log(`[pipeline] Caller said: "${userText}"`);
+  const t_endpointDetected = ms();
+
+  console.log(`\n━━━ Turn: "${userText}" ━━━`);
+  logLatency('EoU latency (silence detect − last audio)', t_lastAudioPacket, t_endpointDetected);
+
   messages.push({ role: 'user', content: userText });
 
   try {
-    // Stream Claude response, TTS each sentence as it completes
+    // ── Play instant bridge filler to hide LLM latency ──
+    const filler = BRIDGE_FILLERS[bridgeIndex++ % BRIDGE_FILLERS.length];
+    const fillerPcm = ttsCache.get(filler.toLowerCase().trim());
+    if (fillerPcm) {
+      console.log(`  ⚡ Bridge: "${filler}"`);
+      player.enqueue(fillerPcm);
+    }
+
+    // ── Parallel TTS pipeline ──
+    // Producer: fires TTS immediately on sentence boundary (stores promises)
+    // Consumer: awaits promises in order and enqueues audio to player
     let buffer = '';
-    const ttsQueue = [];
-    let ttsRunning = false;
+    let t_llmFirstToken = 0;
+    let sentenceIndex = 0;
+    const thisGenId = generationId; // Capture — if barge-in bumps it, we bail
+    const ttsTasks = []; // ordered array of { promise, sentence, idx, t_boundary }
 
-    const processTtsQueue = async () => {
-      if (ttsRunning) return;
-      ttsRunning = true;
-      while (ttsQueue.length > 0) {
-        const sentence = ttsQueue.shift();
-        try {
-          console.log(`[pipeline] TTS sentence: "${sentence}"`);
-          const pcmAudio = await synthesizeSpeech(sentence);
-          await sendPcmToLiveKit(agentSource, pcmAudio);
-        } catch (err) {
-          console.error('[pipeline] Sentence TTS failed:', err.message);
-        }
-      }
-      ttsRunning = false;
-    };
-
-    const enqueueSentence = (sentence) => {
+    const fireTts = (sentence) => {
       const trimmed = sentence.trim();
       if (!trimmed) return;
-      ttsQueue.push(trimmed);
-      processTtsQueue();
+      const idx = sentenceIndex++;
+      logLatency(`S${idx} LLM→TTS start (sentence boundary − endpoint)`, t_endpointDetected, ms());
+      // Fire TTS immediately — don't wait for previous sentence to finish playing
+      const promise = (async () => {
+        const t_ttsStart = ms();
+        const pcm = await cachedSynthesizeSpeech(trimmed);
+        logLatency(`S${idx} TTS synthesis`, t_ttsStart, ms());
+        return pcm;
+      })();
+      ttsTasks.push({ promise, sentence: trimmed, idx });
     };
 
+    const t_llmStart = ms();
+    logLatency('STT finalize (endpoint → LLM request)', t_endpointDetected, t_llmStart);
+
     const responseText = await generateResponseStreaming(messages, (chunk) => {
+      if (!t_llmFirstToken) {
+        t_llmFirstToken = ms();
+        logLatency('LLM TTFT (first token)', t_llmStart, t_llmFirstToken);
+      }
       buffer += chunk;
       // Split on sentence boundaries: . ! ? followed by space or end
       const match = buffer.match(/^(.*?[.!?])\s+(.*)$/s);
       if (match) {
-        enqueueSentence(match[1]);
+        fireTts(match[1]);
         buffer = match[2];
       }
     });
 
     // Flush remaining text
     if (buffer.trim()) {
-      enqueueSentence(buffer);
+      fireTts(buffer);
     }
 
-    // Wait for all TTS to finish
-    while (ttsQueue.length > 0 || ttsRunning) {
-      await new Promise(r => setTimeout(r, 100));
+    const t_llmDone = ms();
+    logLatency('LLM total generation', t_llmStart, t_llmDone);
+
+    // Consumer: await each TTS result in order, enqueue to player
+    for (const { promise, sentence, idx } of ttsTasks) {
+      if (generationId !== thisGenId) {
+        console.log(`  🛑 S${idx}: discarded (barge-in)`);
+        continue;
+      }
+      try {
+        const pcmAudio = await promise;
+        if (generationId !== thisGenId) {
+          console.log(`  🛑 S${idx}: discarded after TTS (barge-in)`);
+          continue;
+        }
+        player.enqueue(pcmAudio);
+        const t_enqueued = ms();
+        logLatency(`S${idx} TOTAL (endpoint → audio enqueued)`, t_endpointDetected, t_enqueued);
+        console.log(`  📢 S${idx}: "${sentence}" (${(pcmAudio.length / 2 / AGENT_SAMPLE_RATE).toFixed(1)}s audio)`);
+      } catch (err) {
+        console.error(`[pipeline] S${idx} TTS failed:`, err.message);
+      }
     }
 
-    console.log(`[pipeline] Counsellor: "${responseText}"`);
+    // Wait for all audio to finish playing (unless barged in)
+    if (generationId === thisGenId) {
+      await player.waitUntilDone();
+    }
+
+    const t_allDone = ms();
+    const bargedIn = generationId !== thisGenId;
+    logLatency(`Full turn (endpoint → ${bargedIn ? 'barge-in' : 'all audio played'})`, t_endpointDetected, t_allDone);
+    console.log(`━━━ End turn${bargedIn ? ' (interrupted)' : ''}: "${responseText}" ━━━\n`);
+
     messages.push({ role: 'assistant', content: responseText });
   } catch (err) {
     console.error('[pipeline] Response pipeline failed:', err.message);
@@ -222,6 +391,9 @@ async function handleEndOfUtterance(agentSource) {
 
 async function main() {
   const httpUrl = LIVEKIT_URL.replace('wss://', 'https://');
+
+  // Pre-warm TTS cache in parallel with room setup
+  const cacheWarmup = warmTtsCache();
 
   // 1. Create the room
   console.log(`[room] Creating room: ${ROOM_NAME}`);
@@ -247,6 +419,7 @@ async function main() {
   // Persistent audio source + track for the agent voice
   const agentSource = new AudioSource(AGENT_SAMPLE_RATE, 1);
   const agentTrack = LocalAudioTrack.createAudioTrack('agent-voice', agentSource);
+  const player = new AudioPlayer(agentSource);
 
   room.on(RoomEvent.ParticipantConnected, (participant) => {
     console.log(`[room] Participant connected: ${participant.identity}`);
@@ -273,15 +446,26 @@ async function main() {
     const sttClient = createSTTClient({
       onPartial: (text) => {
         partialUtterance = text;
+
+        // ── Barge-in: user started talking while agent is playing ──
+        if (text.trim() && player.isPlaying()) {
+          console.log(`[barge-in] 🛑 User interrupted: "${text.trim()}"`);
+          generationId++;
+          player.stopNow();
+          isProcessing = false;
+        }
+
         // Reset silence timer — user is still speaking
         if (utteranceTimer) clearTimeout(utteranceTimer);
+        const pending = (currentUtterance + ' ' + text).trim();
+        const silenceMs = getSilenceTimeout(pending);
         utteranceTimer = setTimeout(() => {
           const fullText = (currentUtterance + ' ' + (partialUtterance || '')).trim();
           currentUtterance = fullText;
           partialUtterance = '';
-          console.log(`[stt] Silence timeout — triggering response (utterance: "${fullText}")`);
-          handleEndOfUtterance(agentSource);
-        }, UTTERANCE_SILENCE_MS);
+          console.log(`[stt] Silence timeout (${silenceMs}ms) — triggering response (utterance: "${fullText}")`);
+          handleEndOfUtterance(player);
+        }, silenceMs);
       },
       onFinal: (text) => {
         console.log(`[stt] Final: "${text}"`);
@@ -290,10 +474,11 @@ async function main() {
         }
         partialUtterance = '';
         if (utteranceTimer) clearTimeout(utteranceTimer);
+        const silenceMs = getSilenceTimeout(currentUtterance);
         utteranceTimer = setTimeout(() => {
-          console.log(`[stt] Silence timeout — triggering response (utterance: "${currentUtterance}")`);
-          handleEndOfUtterance(agentSource);
-        }, UTTERANCE_SILENCE_MS);
+          console.log(`[stt] Silence timeout (${silenceMs}ms) — triggering response (utterance: "${currentUtterance}")`);
+          handleEndOfUtterance(player);
+        }, silenceMs);
       },
       onEndOfUtterance: () => {
         const fullText = (currentUtterance + ' ' + (partialUtterance || '')).trim();
@@ -301,7 +486,7 @@ async function main() {
         partialUtterance = '';
         console.log(`[stt] EndOfUtterance — utterance: "${fullText}", isProcessing: ${isProcessing}`);
         if (utteranceTimer) clearTimeout(utteranceTimer);
-        handleEndOfUtterance(agentSource);
+        handleEndOfUtterance(player);
       },
     });
 
@@ -310,11 +495,12 @@ async function main() {
     console.log('[agent] Waiting for SIP call to be answered before greeting...');
     await callAnswered;
     await new Promise(r => setTimeout(r, 300));
-    await playGreeting(agentSource);
+    await playGreeting(player);
 
     // Stream phone audio to Speechmatics STT
     const audioStream = new AudioStream(track, AGENT_SAMPLE_RATE, 1);
     for await (const frame of audioStream) {
+      t_lastAudioPacket = ms();
       try {
         sttClient.sendAudio(frame.data);
       } catch (err) {
@@ -331,6 +517,9 @@ async function main() {
   publishOptions.source = TrackSource.SOURCE_MICROPHONE;
   await room.localParticipant.publishTrack(agentTrack, publishOptions);
   console.log(`[agent] Audio track published as MICROPHONE source`);
+
+  // Wait for TTS cache warmup to finish before dialing
+  await cacheWarmup;
 
   // 4. Dial the phone number (agent is already in the room waiting)
   console.log(`[sip] Dialing ${PHONE_NUMBER} via trunk ${SIP_TRUNK_ID}...`);

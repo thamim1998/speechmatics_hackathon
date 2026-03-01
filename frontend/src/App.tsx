@@ -1,4 +1,7 @@
 import { useState, type FormEvent } from 'react'
+import { collection, query, orderBy, limit, getDocs } from 'firebase/firestore'
+import { jsPDF } from 'jspdf'
+import { db } from './firebase'
 import { VoiceRecorder } from './components/VoiceRecorder'
 import './App.css'
 
@@ -29,6 +32,148 @@ function App() {
   const [nextId, setNextId] = useState(1)
   const [callStatus, setCallStatus] = useState<'idle' | 'calling' | 'success' | 'error'>('idle')
   const [callError, setCallError] = useState('')
+  const [downloading, setDownloading] = useState(false)
+
+  const handleDownload = async () => {
+    setDownloading(true)
+    try {
+      const q = query(
+        collection(db, 'call_transcripts'),
+        orderBy('createdAt', 'desc'),
+        limit(2),
+      )
+      const snapshot = await getDocs(q)
+
+      if (snapshot.empty) {
+        alert('No conversations found.')
+        return
+      }
+
+      const docs: Record<string, unknown>[] = []
+      snapshot.forEach(doc => docs.push({ id: doc.id, ...doc.data() }))
+
+      const pdf = new jsPDF({ unit: 'mm', format: 'a4' })
+      const W = pdf.internal.pageSize.getWidth()
+      const H = pdf.internal.pageSize.getHeight()
+      const margin = 20
+      const contentW = W - margin * 2
+      let y = 0
+
+      const ensureSpace = (needed: number) => {
+        if (y + needed > H - margin) {
+          pdf.addPage()
+          y = margin
+        }
+      }
+
+      // Header
+      pdf.setFillColor(45, 74, 62)
+      pdf.rect(0, 0, W, 52, 'F')
+      pdf.setFillColor(196, 114, 78)
+      pdf.rect(0, 52, W, 2, 'F')
+
+      pdf.setFont('helvetica', 'bold')
+      pdf.setFontSize(22)
+      pdf.setTextColor(255, 255, 255)
+      pdf.text('Conversation Transcripts', margin, 26)
+
+      pdf.setFont('helvetica', 'normal')
+      pdf.setFontSize(10)
+      pdf.setTextColor(200, 210, 200)
+      const dateStr = new Date().toLocaleDateString('en-GB', {
+        day: 'numeric', month: 'long', year: 'numeric',
+      })
+      pdf.text(`${dateStr}  \u2022  ${docs.length} conversation${docs.length !== 1 ? 's' : ''}`, margin, 38)
+
+      y = 66
+
+      docs.forEach((doc: Record<string, unknown>, docIdx: number) => {
+        ensureSpace(25)
+
+        // Conversation header
+        pdf.setFillColor(245, 243, 240)
+        pdf.roundedRect(margin, y - 3, contentW, 14, 3, 3, 'F')
+        pdf.setFillColor(196, 114, 78)
+        pdf.roundedRect(margin, y - 3, 3, 14, 1.5, 1.5, 'F')
+
+        pdf.setFont('helvetica', 'bold')
+        pdf.setFontSize(12)
+        pdf.setTextColor(45, 74, 62)
+        pdf.text(`Conversation ${docIdx + 1}`, margin + 8, y + 6)
+
+        // Timestamp
+        const raw = doc.createdAt as { toDate?: () => Date; seconds?: number } | string | undefined
+        const ts = raw && typeof raw === 'object' && 'toDate' in raw && raw.toDate
+          ? raw.toDate()
+          : raw && typeof raw === 'object' && 'seconds' in raw && raw.seconds
+            ? new Date(raw.seconds * 1000)
+            : raw ? new Date(raw as string) : null
+
+        if (ts) {
+          pdf.setFont('helvetica', 'normal')
+          pdf.setFontSize(8)
+          pdf.setTextColor(150, 140, 130)
+          pdf.text(
+            ts.toLocaleString('en-GB', { day: 'numeric', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit' }),
+            W - margin, y + 6, { align: 'right' },
+          )
+        }
+
+        y += 18
+
+        // Messages
+        const messages = (doc.messages || doc.transcript || []) as { role?: string; speaker?: string; content?: string; text?: string }[]
+        messages.forEach((msg) => {
+          ensureSpace(16)
+          const role = msg.role || msg.speaker || 'unknown'
+          const text = msg.content || msg.text || ''
+          const isUser = role === 'user' || role === 'caller'
+
+          // Label
+          pdf.setFont('helvetica', 'bold')
+          pdf.setFontSize(7.5)
+          pdf.setTextColor(isUser ? 130 : 45, isUser ? 120 : 74, isUser ? 110 : 62)
+          pdf.text(isUser ? 'CALLER' : 'COUNSELLOR', margin + 2, y)
+          y += 5
+
+          // Bubble
+          const lines = pdf.setFont('helvetica', 'normal').setFontSize(10).splitTextToSize(text, contentW - 14)
+          const blockH = lines.length * 5 + 7
+          ensureSpace(blockH + 4)
+
+          pdf.setFillColor(isUser ? 250 : 240, isUser ? 248 : 247, isUser ? 245 : 245)
+          pdf.setDrawColor(isUser ? 230 : 200, isUser ? 225 : 220, isUser ? 220 : 210)
+          pdf.roundedRect(margin, y - 3, contentW, blockH, 2.5, 2.5, 'FD')
+
+          pdf.setTextColor(60, 55, 50)
+          pdf.text(lines, margin + 7, y + 3.5)
+          y += blockH + 5
+        })
+
+        if (docIdx < docs.length - 1) {
+          y += 6
+          ensureSpace(8)
+          pdf.setDrawColor(220, 215, 210)
+          pdf.setLineWidth(0.3)
+          pdf.line(margin + 30, y, W - margin - 30, y)
+          y += 10
+        }
+      })
+
+      // Footer
+      pdf.setFont('helvetica', 'normal')
+      pdf.setFontSize(7)
+      pdf.setTextColor(160, 155, 150)
+      pdf.text('AI Counsellor  \u2022  Confidential', W / 2, H - 10, { align: 'center' })
+
+      pdf.save('conversation-transcripts.pdf')
+    } catch (err) {
+      console.error('Download failed:', err)
+      alert('Failed to download transcripts. Check console for details.')
+    } finally {
+      setDownloading(false)
+    }
+  }
 
   const handleCall = async () => {
     const digits = contactPhone.replace(/\D/g, '')
@@ -171,6 +316,30 @@ function App() {
         <p className="page-subtitle">
           Fill in your details and prepare your questions
         </p>
+        <button
+          type="button"
+          className="btn-download"
+          onClick={handleDownload}
+          disabled={downloading}
+        >
+          {downloading ? (
+            <>
+              <svg className="spinner" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="18" height="18">
+                <path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83" />
+              </svg>
+              Downloading...
+            </>
+          ) : (
+            <>
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" width="18" height="18">
+                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+                <polyline points="7 10 12 15 17 10" />
+                <line x1="12" y1="15" x2="12" y2="3" />
+              </svg>
+              Download Transcripts
+            </>
+          )}
+        </button>
       </header>
 
       <form onSubmit={handleSubmit} noValidate>

@@ -40,7 +40,7 @@ export async function connectSTT(client) {
   const jwt = await createSpeechmaticsJWT({
     type: 'rt',
     apiKey: SPEECHMATICS_API_KEY,
-    ttl: 300, // 5 minutes
+    ttl: 300,
   });
 
   await client.start(jwt, {
@@ -86,21 +86,19 @@ export async function synthesizeSpeech(text, voice = 'sarah') {
 // ─── Audio Conversion ───────────────────────────────────────────
 
 export function pcm16kToMulaw8k(pcmBuffer) {
-  // Read PCM 16-bit signed LE samples
   const sampleCount = pcmBuffer.length / 2;
   const samples16k = new Int16Array(sampleCount);
   for (let i = 0; i < sampleCount; i++) {
     samples16k[i] = pcmBuffer.readInt16LE(i * 2);
   }
 
-  // Downsample 16kHz → 8kHz (take every other sample)
   const downsampledCount = Math.floor(sampleCount / 2);
   const samples8k = new Int16Array(downsampledCount);
   for (let i = 0; i < downsampledCount; i++) {
     samples8k[i] = samples16k[i * 2];
   }
 
-  // Encode to mulaw
   const mulawBytes = alawmulaw.mulaw.encode(samples8k);
   return Buffer.from(mulawBytes);
 }
+
