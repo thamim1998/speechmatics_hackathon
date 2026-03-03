@@ -5,7 +5,10 @@ An AI-powered voice companion for dementia patients. The agent (Megan) calls pat
 ## Quickstart
 
 ```bash
-# Start all services (agent + backend + frontend)
+# Stop + start (safe to run anytime — kills stale processes first)
+./start.sh stop && ./start.sh
+
+# Or just start (auto-kills existing instances)
 ./start.sh
 
 # Stop all services

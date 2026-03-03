@@ -177,6 +177,35 @@ export default function caretakerRouter({ threadId, assistantId }) {
     }
   });
 
+  // List all threads (conversations) from Backboard
+  router.get("/threads", async (req, res) => {
+    try {
+      const data = await store.client.listThreads(assistantId);
+      const threads = data.threads || data || [];
+      // For each thread, optionally fetch its messages
+      const detailed = await Promise.all(
+        (Array.isArray(threads) ? threads : []).slice(0, 20).map(async (t) => {
+          try {
+            const tid = t.thread_id || t.id;
+            const full = await store.client.getThread(tid);
+            return {
+              thread_id: tid,
+              created_at: t.created_at || full.created_at,
+              updated_at: t.updated_at || full.updated_at,
+              messages: (full.messages || []).slice(0, 50),
+            };
+          } catch {
+            return { thread_id: t.thread_id || t.id, created_at: t.created_at, messages: [] };
+          }
+        })
+      );
+      res.json({ ok: true, threads: detailed });
+    } catch (err) {
+      console.error("[caretaker/threads] error:", err);
+      res.status(500).json({ error: err.message || "Internal error" });
+    }
+  });
+
   // Analytics summary
   router.get("/analytics/summary", async (req, res) => {
     try {

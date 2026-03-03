@@ -158,3 +158,27 @@ export interface MemoriesResponse {
 export function getMemories() {
   return request<MemoriesResponse>("/api/caretaker/memories");
 }
+
+export interface ThreadMessage {
+  role: string;
+  content: string;
+  timestamp?: string;
+  created_at?: string;
+  metadata_?: Record<string, any>;
+}
+
+export interface Thread {
+  thread_id: string;
+  created_at?: string;
+  updated_at?: string;
+  messages: ThreadMessage[];
+}
+
+export interface ThreadsResponse {
+  ok: boolean;
+  threads: Thread[];
+}
+
+export function getThreads() {
+  return request<ThreadsResponse>("/api/caretaker/threads");
+}

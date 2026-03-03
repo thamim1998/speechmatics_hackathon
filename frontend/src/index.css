@@ -7,34 +7,45 @@
 }
 
 :root {
-  --color-cream: #faf6f1;
-  --color-cream-dark: #f0ebe4;
-  --color-forest: #2d4a3e;
-  --color-forest-light: #3d6555;
-  --color-forest-muted: #2d4a3e22;
-  --color-terracotta: #c4724e;
-  --color-terracotta-light: #d4845f;
-  --color-charcoal: #2c2c2c;
-  --color-charcoal-light: #555;
-  --color-border: #d6cfc6;
-  --color-border-focus: #2d4a3e;
+  /* ── Warm cream palette ── */
+  --color-bg: #faf7f2;
+  --color-bg-alt: #f4efe8;
+  --color-cream: #f4efe8;
+  --color-cream-dark: #e8e0d5;
+  --color-primary: #2c2a27;
+  --color-primary-light: #45423d;
+  --color-primary-muted: #2c2a2712;
+  --color-accent: #e07a5f;
+  --color-accent-light: #e8907a;
+  --color-accent-muted: #e07a5f18;
+  --color-charcoal: #2c2a27;
+  --color-charcoal-light: #7c7872;
+  --color-border: #e4ddd4;
+  --color-border-focus: #e07a5f;
   --color-white: #ffffff;
-  --color-error: #c0392b;
+  --color-error: #d94f4f;
   --color-error-bg: #fdf0ee;
 
-  --font-display: 'DM Serif Display', Georgia, serif;
-  --font-body: 'DM Sans', -apple-system, sans-serif;
+  /* Aliases for old variable names */
+  --color-forest: var(--color-primary);
+  --color-forest-light: var(--color-primary-light);
+  --color-forest-muted: var(--color-primary-muted);
+  --color-terracotta: var(--color-accent);
+  --color-terracotta-light: var(--color-accent-light);
 
-  --radius-sm: 6px;
+  --font-display: 'Lora', Georgia, 'Times New Roman', serif;
+  --font-body: 'Lora', Georgia, 'Times New Roman', serif;
+
+  --radius-sm: 8px;
   --radius-md: 12px;
-  --radius-lg: 20px;
+  --radius-lg: 16px;
 
-  --shadow-card: 0 1px 3px rgba(0, 0, 0, 0.04), 0 6px 24px rgba(0, 0, 0, 0.06);
-  --shadow-card-hover: 0 2px 6px rgba(0, 0, 0, 0.06), 0 12px 36px rgba(0, 0, 0, 0.08);
-  --shadow-input-focus: 0 0 0 3px var(--color-forest-muted);
+  --shadow-card: 0 1px 2px rgba(0, 0, 0, 0.03), 0 4px 12px rgba(0, 0, 0, 0.04);
+  --shadow-card-hover: 0 2px 6px rgba(0, 0, 0, 0.05), 0 8px 20px rgba(0, 0, 0, 0.06);
+  --shadow-input-focus: 0 0 0 3px var(--color-accent-muted);
 
-  --transition-base: 0.2s ease;
-  --transition-slow: 0.4s cubic-bezier(0.16, 1, 0.3, 1);
+  --transition-base: 0.15s ease;
+  --transition-slow: 0.3s cubic-bezier(0.16, 1, 0.3, 1);
 }
 
 html {
@@ -44,11 +55,15 @@ html {
 }
 
 body {
-  font-family: var(--font-body);
-  background-color: var(--color-cream);
+  font-family: 'Lora', Georgia, 'Times New Roman', serif;
+  background-color: var(--color-bg);
   color: var(--color-charcoal);
-  line-height: 1.6;
+  line-height: 1.5;
   min-height: 100vh;
+}
+
+input, button, select, textarea {
+  font-family: 'Lora', Georgia, 'Times New Roman', serif;
 }
 
 #root {

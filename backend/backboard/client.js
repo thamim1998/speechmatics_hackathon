@@ -290,6 +290,19 @@ export class BackboardClient {
   }
 
   /**
+   * List all threads for an assistant.
+   */
+  async listThreads(assistantId) {
+    const res = await fetch(`${BASE_URL}/assistants/${assistantId}/threads`, {
+      method: "GET",
+      headers: this.authHeaders(),
+    });
+    const text = await res.text();
+    mustOk(res, text);
+    return JSON.parse(text);
+  }
+
+  /**
    * Get all memories extracted by Backboard for an assistant.
    * Returns { memories: [{ id, content, metadata, created_at, updated_at }] }
    */

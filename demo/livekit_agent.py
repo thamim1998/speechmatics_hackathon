@@ -38,26 +38,46 @@ ASSISTANT_FILE = Path(__file__).parent / ".livekit_assistant_id"
 PATIENT_PROFILE_PATH = Path(__file__).parent / "patient_profile.md"
 
 
-def send_whatsapp_alert(message):
-    """Send a WhatsApp message to the caretaker via Twilio."""
+def send_whatsapp_alert(patient_text, sentiment_confidence):
+    """Send a WhatsApp CRITICAL alert to the caretaker via Twilio.
+    Uses Appointment Reminders template: {{1}} = date, {{2}} = time.
+    We repurpose: {{1}} = "CRITICAL ALERT - check patient", {{2}} = what patient said.
+    """
     if not all([TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, CARETAKER_PHONE]):
         logger.warning("Twilio WhatsApp not configured — skipping alert")
         return
     try:
+        import json as _json
         to = f"whatsapp:{CARETAKER_PHONE}"
-        resp = requests.post(
-            f"https://api.twilio.com/2010-04-01/Accounts/{TWILIO_ACCOUNT_SID}/Messages.json",
-            auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN),
-            data={
-                "From": TWILIO_WHATSAPP_FROM,
-                "To": to,
-                "Body": message,
-            },
-        )
+        url = f"https://api.twilio.com/2010-04-01/Accounts/{TWILIO_ACCOUNT_SID}/Messages.json"
+        auth = (TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+        content_sid = os.getenv("TWILIO_CONTENT_SID", "HXb5b62575e6e4ff6129ad7c8efe1f983e")
+
+        # Clean the patient text — no emojis, no newlines, short
+        clean_text = patient_text.replace("\n", " ").strip()[:60]
+
+        resp = requests.post(url, auth=auth, data={
+            "From": TWILIO_WHATSAPP_FROM,
+            "To": to,
+            "ContentSid": content_sid,
+            "ContentVariables": _json.dumps({
+                "1": "CRITICAL ALERT - check on patient now",
+                "2": clean_text,
+            }),
+        })
+
+        result = resp.json()
+        status = result.get("status", "unknown")
+        sid = result.get("sid", "")
+        error_code = result.get("error_code")
+        error_msg = result.get("error_message", "")
+
         if resp.ok:
-            logger.info(f"WhatsApp alert sent to {CARETAKER_PHONE}")
+            logger.info(f"WhatsApp alert SENT — SID: {sid}, status: {status}, to: {CARETAKER_PHONE}")
         else:
-            logger.error(f"WhatsApp alert failed: {resp.status_code} {resp.text[:200]}")
+            logger.error(f"WhatsApp alert failed: {resp.status_code} — {error_code}: {error_msg}")
+            # Log full response for debugging
+            logger.error(f"Response: {result}")
     except Exception as e:
         logger.error(f"WhatsApp alert error: {e}")
 
@@ -187,9 +207,15 @@ class SessionTracker:
     def log_user_message(self, text):
         elapsed = time.time() - self.start_time
         sentiment, confidence = analyze_sentiment(text)
-        badge = sentiment_badge(sentiment, confidence)
-        print(f"\n  {C.DIM}[{fmt_time(elapsed)}]{C.RESET} {C.CYAN}Patient:{C.RESET} {text}")
-        print(f"  {' ' * 9}{badge}")
+        if sentiment == "CRITICAL":
+            badge = f"\033[41m\033[97m\033[1m !! CRITICAL {confidence:.0%} !! \033[0m"
+        elif sentiment == "negative":
+            badge = f"\033[91m[NEGATIVE {confidence:.0%}]\033[0m"
+        elif sentiment == "positive":
+            badge = f"\033[92m[POSITIVE {confidence:.0%}]\033[0m"
+        else:
+            badge = f"\033[93m[NEUTRAL {confidence:.0%}]\033[0m"
+        logger.opt(colors=True).info(f"[{fmt_time(elapsed)}] \033[96m🗣️ Patient:\033[0m {text}  {badge}")
 
         self.messages.append({
             "timestamp": datetime.now().isoformat(),
@@ -201,14 +227,8 @@ class SessionTracker:
         })
 
         if sentiment == "CRITICAL":
-            print(f"\n  {C.BG_RED}{C.WHITE}{C.BOLD}  !! ALERT: Critical concern - notifying caretaker !!  {C.RESET}\n")
-            send_whatsapp_alert(
-                f"🚨 CRITICAL ALERT from Megan (Voice Agent)\n\n"
-                f"Patient said: \"{text[:200]}\"\n\n"
-                f"Sentiment: CRITICAL ({confidence:.0%} confidence)\n"
-                f"Time: {datetime.now().strftime('%H:%M:%S')}\n\n"
-                f"Please check on the patient immediately."
-            )
+            logger.opt(colors=True).warning(f"\033[41m\033[97m\033[1m !! CRITICAL CONCERN — NOTIFYING CARETAKER !! \033[0m")
+            send_whatsapp_alert(text, confidence)
 
     def llm_start(self):
         self._llm_start = time.time()
@@ -224,11 +244,14 @@ class SessionTracker:
         ttfb = (self._llm_first_token - self._llm_start) if self._llm_first_token and self._llm_start else llm_total
 
         sentiment, confidence = analyze_sentiment(text)
-        badge = sentiment_badge(sentiment, confidence)
+        if sentiment == "positive":
+            badge = f"\033[92m[POSITIVE {confidence:.0%}]\033[0m"
+        elif sentiment == "negative":
+            badge = f"\033[91m[NEGATIVE {confidence:.0%}]\033[0m"
+        else:
+            badge = f"\033[93m[NEUTRAL {confidence:.0%}]\033[0m"
 
-        print(f"  {C.DIM}[{fmt_time(elapsed)}]{C.RESET} {C.MAGENTA}Megan:{C.RESET} {text}")
-        print(f"  {' ' * 9}{badge}")
-        print(f"  {C.DIM}  LLM: {llm_total:.1f}s total, TTFB: {ttfb:.1f}s{C.RESET}")
+        logger.opt(colors=True).info(f"[{fmt_time(elapsed)}] \033[95m🤖 Megan:\033[0m {text}  {badge}  \033[2mLLM: {llm_total:.1f}s, TTFB: {ttfb:.1f}s\033[0m")
 
         self.messages.append({
             "timestamp": datetime.now().isoformat(),
@@ -285,72 +308,71 @@ class SessionTracker:
     def print_summary(self, caretaker_summary=None):
         report = self.get_session_report()
         n = report["exchanges"]
+        R, G, Y, M, CN, B, D, RST = C.RED, C.GREEN, C.YELLOW, C.MAGENTA, C.CYAN, C.BOLD, C.DIM, C.RESET
+        BG_R, W = C.BG_RED, C.WHITE
 
-        print(f"\n{C.BOLD}{'=' * 60}{C.RESET}")
-        print(f"{C.BOLD}  SESSION SUMMARY{C.RESET}")
-        print(f"{C.BOLD}{'=' * 60}{C.RESET}")
-        print(f"  Date:              {report['day']}, {report['date']}")
-        print(f"  Time:              {report['time']}")
-        print(f"  Duration:          {fmt_time(report['duration_s'])} ({report['duration_s']:.1f}s)")
-        print(f"  Exchanges:         {n}")
+        logger.opt(colors=True).info(f"{B}{'=' * 60}{RST}")
+        logger.opt(colors=True).info(f"{B}  SESSION SUMMARY{RST}")
+        logger.opt(colors=True).info(f"{B}{'=' * 60}{RST}")
+        logger.info(f"Date: {report['day']}, {report['date']}  |  Time: {report['time']}")
+        logger.info(f"Duration: {fmt_time(report['duration_s'])} ({report['duration_s']:.1f}s)  |  Exchanges: {n}")
 
         if self.exchange_times:
-            print(f"  Avg TTFB:          {report['avg_ttfb_s']:.1f}s")
-            print(f"  Avg LLM total:     {report['avg_llm_total_s']:.1f}s")
+            logger.info(f"Avg TTFB: {report['avg_ttfb_s']:.1f}s  |  Avg LLM: {report['avg_llm_total_s']:.1f}s")
             fastest = min(e["ttfb"] for e in self.exchange_times)
             slowest = max(e["ttfb"] for e in self.exchange_times)
-            print(f"  Fastest TTFB:      {fastest:.1f}s")
-            print(f"  Slowest TTFB:      {slowest:.1f}s")
+            logger.info(f"Fastest TTFB: {fastest:.1f}s  |  Slowest TTFB: {slowest:.1f}s")
 
-            print(f"\n  {C.BOLD}Exchange Timing:{C.RESET}")
-            print(f"  {'-' * 35}")
-            print(f"  {'#':>3}  {'TTFB':>7}  {'LLM Total':>10}")
-            print(f"  {'---':>3}  {'-------':>7}  {'----------':>10}")
+            logger.opt(colors=True).info(f"{B}--- Exchange Timing ---{RST}")
             for e in self.exchange_times:
-                print(f"  {e['exchange']:>3}  {e['ttfb']:>6.1f}s  {e['llm']:>9.1f}s")
-            print(f"  {'AVG':>3}  {report['avg_ttfb_s']:>6.1f}s  {report['avg_llm_total_s']:>9.1f}s")
+                logger.opt(colors=True).info(f"  #{e['exchange']}  TTFB: {D}{e['ttfb']:.1f}s{RST}  LLM: {D}{e['llm']:.1f}s{RST}")
 
         # Message sentiment
         patient_msgs = [m for m in self.messages if m["speaker"] == "patient"]
         if patient_msgs:
             sc = report["sentiment_counts"]
-            print(f"\n  {C.BOLD}Message-by-Message Sentiment:{C.RESET}")
-            print(f"  {'-' * 56}")
+            logger.opt(colors=True).info(f"{B}--- Message-by-Message Sentiment ---{RST}")
             for entry in self.messages:
                 t = fmt_time(entry["elapsed_s"])
-                badge = sentiment_badge(entry["sentiment"], entry["confidence"])
-                speaker_color = C.CYAN if entry["speaker"] == "patient" else C.MAGENTA
-                speaker_label = "Patient" if entry["speaker"] == "patient" else "Megan  "
-                text_preview = entry["text"][:50] + ("..." if len(entry["text"]) > 50 else "")
-                print(f"  {C.DIM}[{t}]{C.RESET} {speaker_color}{speaker_label}{C.RESET} {badge}")
-                print(f"         {C.DIM}\"{text_preview}\"{C.RESET}")
+                if entry["speaker"] == "patient":
+                    speaker = f"{CN}🗣️ Patient{RST}"
+                else:
+                    speaker = f"{M}🤖 Megan{RST}"
+                text_preview = entry["text"][:60] + ("..." if len(entry["text"]) > 60 else "")
+                s = entry["sentiment"]
+                if s == "CRITICAL":
+                    badge = f"{BG_R}{W}{B} CRITICAL {entry['confidence']:.0%} {RST}"
+                elif s == "negative":
+                    badge = f"{R}[NEGATIVE {entry['confidence']:.0%}]{RST}"
+                elif s == "positive":
+                    badge = f"{G}[POSITIVE {entry['confidence']:.0%}]{RST}"
+                else:
+                    badge = f"{Y}[NEUTRAL {entry['confidence']:.0%}]{RST}"
+                logger.opt(colors=True).info(f"[{t}] {speaker}: {D}\"{text_preview}\"{RST}  {badge}")
 
-            print(f"\n  {C.BOLD}Patient Sentiment Overview:{C.RESET}")
-            print(f"  {'-' * 56}")
+            logger.opt(colors=True).info(f"{B}--- Patient Sentiment Overview ---{RST}")
             if sc["critical"] > 0:
-                print(f"  {C.BG_RED}{C.WHITE}{C.BOLD}  CRITICAL: {sc['critical']}  {C.RESET}  !! Alert caretaker !!")
-            print(f"  {C.GREEN}  Positive: {sc['positive']:>3}{C.RESET}  {'#' * sc['positive']}")
-            print(f"  {C.YELLOW}  Neutral:  {sc['neutral']:>3}{C.RESET}  {'#' * sc['neutral']}")
-            print(f"  {C.RED}  Negative: {sc['negative']:>3}{C.RESET}  {'#' * sc['negative']}")
+                logger.opt(colors=True).warning(f"{BG_R}{W}{B} CRITICAL: {sc['critical']} — Alert caretaker! {RST}")
+            logger.opt(colors=True).info(f"{G}Positive: {sc['positive']}{RST}  |  {Y}Neutral: {sc['neutral']}{RST}  |  {R}Negative: {sc['negative']}{RST}")
 
             overall = report["overall_sentiment"]
             if overall == "CRITICAL":
-                mood = f"{C.BG_RED}{C.WHITE}{C.BOLD} ALERT - CRITICAL CONCERNS {C.RESET}"
+                mood = f"{BG_R}{W}{B} ALERT - CRITICAL CONCERNS {RST}"
             elif overall == "negative":
-                mood = f"{C.RED}{C.BOLD} Patient seems DOWN {C.RESET}"
+                mood = f"{R}{B}Patient seems DOWN{RST}"
             elif overall == "positive":
-                mood = f"{C.GREEN}{C.BOLD} Patient in GOOD spirits {C.RESET}"
+                mood = f"{G}{B}Patient in GOOD spirits{RST}"
             else:
-                mood = f"{C.YELLOW}{C.BOLD} Patient mood NEUTRAL {C.RESET}"
-            print(f"\n  Overall Mood: {mood}")
+                mood = f"{Y}{B}Patient mood NEUTRAL{RST}"
+            logger.opt(colors=True).info(f"Overall Mood: {mood}")
 
         if caretaker_summary:
-            print(f"\n  {C.BOLD}Caretaker Summary:{C.RESET}")
-            print(f"  {'-' * 56}")
+            logger.opt(colors=True).info(f"{B}--- Caretaker Summary ---{RST}")
             for line in caretaker_summary.split("\n"):
-                print(f"  {line}")
+                if line.strip():
+                    logger.info(line.strip())
 
-        print(f"{C.BOLD}{'=' * 60}{C.RESET}")
+        logger.opt(colors=True).info(f"{B}{'=' * 60}{RST}")
 
 
 # ── Backboard (Memory Only) ────────────────────────────────────────────────
@@ -535,9 +557,12 @@ class CareAgent(Agent):
 
     async def on_user_turn_completed(self, turn_ctx, new_message):
         """Called after user finishes speaking."""
-        user_text = new_message.text_content if isinstance(new_message.text_content, str) else str(new_message.text_content)
-        if user_text:
-            tracker.log_user_message(user_text)
+        try:
+            user_text = new_message.text_content if isinstance(new_message.text_content, str) else str(new_message.text_content)
+            if user_text and user_text != "None":
+                tracker.log_user_message(user_text)
+        except Exception as e:
+            logger.error(f"on_user_turn_completed error: {e}")
 
 
 # ── Entrypoint ─────────────────────────────────────────────────────────────
@@ -582,6 +607,7 @@ async def entrypoint(ctx):
     def on_agent_state_changed(event):
         new_state = event.new_state if hasattr(event, "new_state") else str(event)
         old_state = event.old_state if hasattr(event, "old_state") else ""
+        logger.debug(f"[STATE] {old_state} → {new_state}")
         if new_state == "thinking":
             tracker.llm_start()
         elif new_state == "speaking" and old_state == "thinking":
@@ -597,52 +623,82 @@ async def entrypoint(ctx):
             ttft = getattr(metrics, "ttft", None)
             duration = getattr(metrics, "duration", None)
             tokens_per_s = getattr(metrics, "tokens_per_second", None)
-            print(f"  {C.DIM}[METRICS] LLM TTFT: {ttft:.3f}s, duration: {duration:.2f}s, tokens/s: {tokens_per_s:.1f}{C.RESET}" if ttft else f"  {C.DIM}[METRICS] LLM: {metrics}{C.RESET}")
+            if ttft:
+                logger.debug(f"[METRICS] LLM TTFT: {ttft:.3f}s, duration: {duration:.2f}s, tokens/s: {tokens_per_s:.1f}")
         elif name == "TTSMetrics":
             ttfb = getattr(metrics, "ttfb", None)
             duration = getattr(metrics, "duration", None)
-            print(f"  {C.DIM}[METRICS] TTS TTFB: {ttfb:.3f}s, duration: {duration:.2f}s{C.RESET}" if ttfb else f"  {C.DIM}[METRICS] TTS: {metrics}{C.RESET}")
+            if ttfb:
+                logger.debug(f"[METRICS] TTS TTFB: {ttfb:.3f}s, duration: {duration:.2f}s")
         elif name == "EOUMetrics":
             eou_delay = getattr(metrics, "end_of_utterance_delay", None)
             transcription_delay = getattr(metrics, "transcription_delay", None)
-            print(f"  {C.DIM}[METRICS] EOU delay: {eou_delay:.3f}s, transcription delay: {transcription_delay:.3f}s{C.RESET}" if eou_delay else f"  {C.DIM}[METRICS] EOU: {metrics}{C.RESET}")
+            if eou_delay:
+                logger.debug(f"[METRICS] EOU delay: {eou_delay:.3f}s, transcription: {transcription_delay:.3f}s")
 
     session.on("metrics_collected", on_metrics_collected)
 
     # Track assistant messages for session report
     def on_conversation_item(event):
-        item = event.item
-        if item.role == "assistant":
-            text = item.text_content if isinstance(item.text_content, str) else str(item.text_content)
-            if text:
-                tracker.log_assistant_message(text)
+        try:
+            item = event.item
+            if item.role == "assistant":
+                text = item.text_content if isinstance(item.text_content, str) else str(item.text_content)
+                if text and text != "None":
+                    tracker.log_assistant_message(text)
+        except Exception as e:
+            logger.error(f"on_conversation_item error: {e}")
 
     session.on("conversation_item_added", on_conversation_item)
 
+    # Also track user input transcription in real-time
+    def on_user_input_transcribed(event):
+        transcript = getattr(event, "transcript", "") or ""
+        is_final = getattr(event, "is_final", False)
+        if transcript.strip():
+            if is_final:
+                logger.opt(colors=True).info(f"\033[96m[STT FINAL]\033[0m {transcript}")
+            else:
+                logger.opt(colors=True).debug(f"\033[2m[STT partial] {transcript}\033[0m")
+
+    session.on("user_input_transcribed", on_user_input_transcribed)
+
     # Start
-    print(f"\n  {C.GREEN}{C.BOLD}Session starting...{C.RESET}")
+    logger.info("=" * 60)
+    logger.info("🎙️  SESSION STARTING — Waiting for patient...")
+    logger.info("=" * 60)
     await session.start(room=ctx.room, agent=CareAgent())
 
     # When session ends (room closes), generate summary and save
     @ctx.add_shutdown_callback
     async def on_shutdown():
+        import asyncio as _asyncio
         report = tracker.get_session_report()
         if report["exchanges"] == 0 and not report["messages"]:
-            print(f"\n  {C.DIM}No exchanges — skipping summary.{C.RESET}")
+            logger.info("No exchanges — skipping summary.")
             return
 
-        # Generate caretaker summary via Backboard
-        print(f"\n  {C.CYAN}Generating caretaker summary...{C.RESET}")
-        summary = await generate_caretaker_summary(bb_assistant_id, report)
+        # Print local summary FIRST (instant — before process timeout)
+        tracker.print_summary()
 
-        # Print summary
-        tracker.print_summary(caretaker_summary=summary)
+        # Try Backboard API with 7s timeout (process gets killed at 10s)
+        try:
+            summary = await _asyncio.wait_for(
+                generate_caretaker_summary(bb_assistant_id, report),
+                timeout=7.0,
+            )
+            logger.info(f"Caretaker Summary: {summary}")
+            await _asyncio.wait_for(
+                save_summary_to_backboard(bb_assistant_id, report, summary),
+                timeout=7.0,
+            )
+            logger.info("Summary saved to Backboard.")
+        except _asyncio.TimeoutError:
+            logger.warning("Backboard API timed out — local summary printed above.")
+        except Exception as e:
+            logger.error(f"Summary save failed: {e}")
 
-        # Save summary to Backboard (for next session memory)
-        print(f"\n  {C.CYAN}Saving to Backboard memory...{C.RESET}")
-        await save_summary_to_backboard(bb_assistant_id, report, summary)
-
-        print(f"\n  {C.GREEN}Session complete.{C.RESET}")
+        logger.info("Session complete.")
 
 
 if __name__ == "__main__":

@@ -35,7 +35,7 @@ echo "=== Starting Dementia Voice Agent ==="
 
 # Python Agent
 echo "[1/3] Starting Python agent (LiveKit)..."
-(cd "$ROOT_DIR/demo" && uv run python livekit_agent.py dev) &
+(cd "$ROOT_DIR/demo" && PYTHONUNBUFFERED=1 uv run python -u livekit_agent.py dev) &
 AGENT_PID=$!
 
 sleep 3
@@ -59,7 +59,6 @@ echo "=== All services running ==="
 echo "  Agent:     Python LiveKit agent (listening for calls)"
 echo "  Backend:   http://localhost:3000"
 echo "  Frontend:  http://localhost:5173"
-echo "  Caretaker: http://localhost:5173/?portal=caretaker"
 echo ""
 echo "  To stop:   ./start.sh stop"
 echo "  Or press Ctrl+C"
