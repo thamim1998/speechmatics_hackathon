@@ -440,9 +440,7 @@
 
 import CaretakerPortal from './features/caretaker/CaretakerPortal'
 import { useState, type FormEvent } from 'react'
-import { collection, query, orderBy, limit, getDocs } from 'firebase/firestore'
 import { jsPDF } from 'jspdf'
-import { db } from './firebase'
 import { VoiceRecorder } from './components/VoiceRecorder'
 import './App.css'
 
@@ -490,20 +488,14 @@ function PatientPortal() {
   const handleDownload = async () => {
     setDownloading(true)
     try {
-      const q = query(
-        collection(db, 'call_transcripts'),
-        orderBy('createdAt', 'desc'),
-        limit(2),
-      )
-      const snapshot = await getDocs(q)
+      const res = await fetch('/api/caretaker/transcripts')
+      const data = await res.json()
+      const transcripts = data.transcripts || []
 
-      if (snapshot.empty) {
+      if (transcripts.length === 0) {
         alert('No conversations found.')
         return
       }
-
-      const docs: Record<string, unknown>[] = []
-      snapshot.forEach(doc => docs.push({ id: doc.id, ...doc.data() }))
 
       const pdf = new jsPDF({ unit: 'mm', format: 'a4' })
       const W = pdf.internal.pageSize.getWidth()
@@ -536,14 +528,14 @@ function PatientPortal() {
       const dateStr = new Date().toLocaleDateString('en-GB', {
         day: 'numeric', month: 'long', year: 'numeric',
       })
-      pdf.text(`${dateStr}  \u2022  ${docs.length} conversation${docs.length !== 1 ? 's' : ''}`, margin, 38)
+      pdf.text(`${dateStr}  \u2022  ${transcripts.length} session${transcripts.length !== 1 ? 's' : ''}`, margin, 38)
 
       y = 66
 
-      docs.forEach((doc: Record<string, unknown>, docIdx: number) => {
+      transcripts.forEach((session: any, idx: number) => {
         ensureSpace(25)
 
-        // Conversation header
+        // Session header
         pdf.setFillColor(245, 243, 240)
         pdf.roundedRect(margin, y - 3, contentW, 14, 3, 3, 'F')
         pdf.setFillColor(196, 114, 78)
@@ -552,58 +544,33 @@ function PatientPortal() {
         pdf.setFont('helvetica', 'bold')
         pdf.setFontSize(12)
         pdf.setTextColor(45, 74, 62)
-        pdf.text(`Conversation ${docIdx + 1}`, margin + 8, y + 6)
 
-        // Timestamp
-        const raw = doc.createdAt as { toDate?: () => Date; seconds?: number } | string | undefined
-        const ts = raw && typeof raw === 'object' && 'toDate' in raw && raw.toDate
-          ? raw.toDate()
-          : raw && typeof raw === 'object' && 'seconds' in raw && raw.seconds
-            ? new Date(raw.seconds * 1000)
-            : raw ? new Date(raw as string) : null
-
-        if (ts) {
-          pdf.setFont('helvetica', 'normal')
-          pdf.setFontSize(8)
-          pdf.setTextColor(150, 140, 130)
-          pdf.text(
-            ts.toLocaleString('en-GB', { day: 'numeric', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit' }),
-            W - margin, y + 6, { align: 'right' },
-          )
-        }
+        const md = session.metadata_ || {}
+        const sessionData = md.data || {}
+        const title = sessionData.date
+          ? `Call Session — ${sessionData.day || ''} ${sessionData.date} at ${sessionData.time || ''}`
+          : `Session ${idx + 1}`
+        pdf.text(title, margin + 8, y + 6)
 
         y += 18
 
-        // Messages
-        const messages = (doc.messages || doc.transcript || []) as { role?: string; speaker?: string; content?: string; text?: string }[]
-        messages.forEach((msg) => {
-          ensureSpace(16)
-          const role = msg.role || msg.speaker || 'unknown'
-          const text = msg.content || msg.text || ''
-          const isUser = role === 'user' || role === 'caller'
-
-          // Label
-          pdf.setFont('helvetica', 'bold')
-          pdf.setFontSize(7.5)
-          pdf.setTextColor(isUser ? 130 : 45, isUser ? 120 : 74, isUser ? 110 : 62)
-          pdf.text(isUser ? 'CALLER' : 'COUNSELLOR', margin + 2, y)
-          y += 5
-
-          // Bubble
-          const lines = pdf.setFont('helvetica', 'normal').setFontSize(10).splitTextToSize(text, contentW - 14)
+        // Content (transcript text)
+        const content = session.content || ''
+        if (content) {
+          const lines = pdf.setFont('helvetica', 'normal').setFontSize(10).splitTextToSize(content, contentW - 14)
           const blockH = lines.length * 5 + 7
           ensureSpace(blockH + 4)
 
-          pdf.setFillColor(isUser ? 250 : 240, isUser ? 248 : 247, isUser ? 245 : 245)
-          pdf.setDrawColor(isUser ? 230 : 200, isUser ? 225 : 220, isUser ? 220 : 210)
+          pdf.setFillColor(250, 248, 245)
+          pdf.setDrawColor(230, 225, 220)
           pdf.roundedRect(margin, y - 3, contentW, blockH, 2.5, 2.5, 'FD')
 
           pdf.setTextColor(60, 55, 50)
           pdf.text(lines, margin + 7, y + 3.5)
           y += blockH + 5
-        })
+        }
 
-        if (docIdx < docs.length - 1) {
+        if (idx < transcripts.length - 1) {
           y += 6
           ensureSpace(8)
           pdf.setDrawColor(220, 215, 210)
@@ -617,7 +584,7 @@ function PatientPortal() {
       pdf.setFont('helvetica', 'normal')
       pdf.setFontSize(7)
       pdf.setTextColor(160, 155, 150)
-      pdf.text('AI Counsellor  \u2022  Confidential', W / 2, H - 10, { align: 'center' })
+      pdf.text('Dementia Voice Agent  \u2022  Confidential', W / 2, H - 10, { align: 'center' })
 
       pdf.save('conversation-transcripts.pdf')
     } catch (err) {

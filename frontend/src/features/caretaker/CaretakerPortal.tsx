@@ -17,14 +17,15 @@ import {
 import {
   addEvent,
   getAnalyticsSummary,
+  getMemories,
   getTimeline,
+  getTranscripts,
   type CaretakerEventType,
+  type Memory,
   type TimelineMessage,
 } from "./api/caretakerApi";
 
-import { collection, query, orderBy, limit, getDocs } from "firebase/firestore";
 import { jsPDF } from "jspdf";
-import { db } from "../../firebase";
 
 // ----------------------
 // Color coding
@@ -36,6 +37,7 @@ const TYPE_COLORS: Record<string, string> = {
   incident: "#F97316", // orange
   medication: "#A855F7", // purple
   profile: "#64748B", // slate
+  call_session: "#EC4899", // pink
   unknown: "#94A3B8",
 };
 
@@ -143,6 +145,7 @@ function SectionBadge({ children }: { children: React.ReactNode }) {
 // ----------------------
 export default function CaretakerPortal() {
   const [timeline, setTimeline] = useState<TimelineMessage[]>([]);
+  const [memories, setMemories] = useState<Memory[]>([]);
   const [loading, setLoading] = useState(true);
   const [summary, setSummary] = useState<any>(null);
   const [error, setError] = useState("");
@@ -184,22 +187,81 @@ export default function CaretakerPortal() {
   const [fromDay, setFromDay] = useState<string>("");
   const [toDay, setToDay] = useState<string>("");
 
+  // call patient
+  const [callPhone, setCallPhone] = useState("+917202849884");
+  const [callStatus, setCallStatus] = useState<"idle" | "calling" | "success" | "error">("idle");
+  const [callError, setCallError] = useState("");
+
+  const handleCallPatient = async () => {
+    const digits = callPhone.replace(/\D/g, "");
+    if (digits.length < 9) {
+      setCallError("Enter a valid phone number first");
+      return;
+    }
+    setCallStatus("calling");
+    setCallError("");
+    try {
+      const res = await fetch("/api/call", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ phoneNumber: callPhone }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || "Call failed");
+      setCallStatus("success");
+      setTimeout(() => setCallStatus("idle"), 4000);
+    } catch (err: any) {
+      setCallStatus("error");
+      setCallError(err instanceof Error ? err.message : "Call failed");
+      setTimeout(() => setCallStatus("idle"), 4000);
+    }
+  };
+
   // report download
   const [downloading, setDownloading] = useState(false);
 
   const handleDownload = async () => {
     setDownloading(true);
     try {
-      const q = query(collection(db, "call_transcripts"), orderBy("createdAt", "desc"), limit(2));
-      const snapshot = await getDocs(q);
+      // Fetch timeline + memories in parallel
+      const [tlData, memData] = await Promise.all([
+        getTimeline(),
+        getMemories(),
+      ]);
+      const entries = (tlData.messages || []).sort((a, b) => {
+        const ta = new Date(getPrimaryISO(a)).getTime();
+        const tb = new Date(getPrimaryISO(b)).getTime();
+        return tb - ta;
+      });
+      const patientMemories = (memData.memories || []).filter((m) => {
+        const lower = m.content.toLowerCase();
+        if (lower.startsWith("user is sarah") || lower.startsWith("user is megan")) return false;
+        if (lower.startsWith("megan ") || lower.startsWith("megan's ")) return false;
+        if (lower.startsWith("sarah ") || lower.startsWith("sarah's ")) return false;
+        return true;
+      });
 
-      if (snapshot.empty) {
-        alert("No conversations found.");
+      // Deduplicate memories by content
+      const seen = new Set<string>();
+      const uniqueMemories = patientMemories.filter((m) => {
+        const key = m.content.toLowerCase().trim();
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      });
+
+      if (entries.length === 0 && uniqueMemories.length === 0) {
+        alert("No data to download.");
         return;
       }
 
-      const docs: Record<string, any>[] = [];
-      snapshot.forEach((doc) => docs.push({ id: doc.id, ...doc.data() }));
+      // Try to extract name from memories
+      const nameMemory = uniqueMemories.find((m) => m.content.toLowerCase().includes("name is "));
+      let personName = "Abhishek";
+      if (nameMemory) {
+        const match = nameMemory.content.match(/name is (\w+)/i);
+        if (match) personName = match[1];
+      }
 
       const pdf = new jsPDF({ unit: "mm", format: "a4" });
       const W = pdf.internal.pageSize.getWidth();
@@ -215,7 +277,7 @@ export default function CaretakerPortal() {
         }
       };
 
-      // Header
+      // ── Header ──
       pdf.setFillColor(45, 74, 62);
       pdf.rect(0, 0, W, 52, "F");
       pdf.setFillColor(196, 114, 78);
@@ -224,138 +286,111 @@ export default function CaretakerPortal() {
       pdf.setFont("helvetica", "bold");
       pdf.setFontSize(22);
       pdf.setTextColor(255, 255, 255);
-      pdf.text("Conversation Transcripts", margin, 26);
-
-      pdf.setFont("helvetica", "normal");
-      pdf.setFontSize(10);
-      pdf.setTextColor(200, 210, 200);
       const dateStr = new Date().toLocaleDateString("en-GB", {
         day: "numeric",
         month: "long",
         year: "numeric",
       });
+      pdf.text(`${personName}'s Care Report — ${dateStr}`, margin, 26);
+
+      pdf.setFont("helvetica", "normal");
+      pdf.setFontSize(10);
+      pdf.setTextColor(200, 210, 200);
       pdf.text(
-        `${dateStr}  •  ${docs.length} conversation${docs.length !== 1 ? "s" : ""}`,
+        `${entries.length} timeline entries  •  ${uniqueMemories.length} memories`,
         margin,
         38,
       );
-
       y = 66;
 
-      docs.forEach((doc: Record<string, any>, docIdx: number) => {
-        ensureSpace(25);
-
-        // Conversation header
-        pdf.setFillColor(245, 243, 240);
-        pdf.roundedRect(margin, y - 3, contentW, 14, 3, 3, "F");
-        pdf.setFillColor(196, 114, 78);
-        pdf.roundedRect(margin, y - 3, 3, 14, 1.5, 1.5, "F");
-
+      // ── Section 1: What Megan Knows ──
+      if (uniqueMemories.length > 0) {
+        ensureSpace(20);
+        pdf.setFillColor(224, 242, 254);
+        pdf.roundedRect(margin, y - 3, contentW, 12, 3, 3, "F");
         pdf.setFont("helvetica", "bold");
-        pdf.setFontSize(12);
-        pdf.setTextColor(45, 74, 62);
-        pdf.text(`Conversation ${docIdx + 1}`, margin + 8, y + 6);
+        pdf.setFontSize(13);
+        pdf.setTextColor(3, 105, 161);
+        pdf.text(`What Megan Knows About ${personName}`, margin + 6, y + 5);
+        y += 16;
 
-        // Timestamp
-        const raw = doc.createdAt as
-          | { toDate?: () => Date; seconds?: number }
-          | string
-          | undefined;
-
-        const ts =
-          raw &&
-          typeof raw === "object" &&
-          "toDate" in raw &&
-          typeof raw.toDate === "function"
-            ? raw.toDate()
-            : raw &&
-              typeof raw === "object" &&
-              "seconds" in raw &&
-              typeof raw.seconds === "number"
-              ? new Date(raw.seconds * 1000)
-              : raw
-              ? new Date(raw as string)
-              : null;
-
-        if (ts) {
-          pdf.setFont("helvetica", "normal");
-          pdf.setFontSize(8);
-          pdf.setTextColor(150, 140, 130);
-          pdf.text(
-            ts.toLocaleString("en-GB", {
-              day: "numeric",
-              month: "short",
-              year: "numeric",
-              hour: "2-digit",
-              minute: "2-digit",
-            }),
-            W - margin,
-            y + 6,
-            { align: "right" },
-          );
-        }
-
-        y += 18;
-
-        // Messages
-        const messages = (doc.messages || doc.transcript || []) as {
-          role?: string;
-          speaker?: string;
-          content?: string;
-          text?: string;
-        }[];
-
-        messages.forEach((msg) => {
-          ensureSpace(16);
-          const role = msg.role || msg.speaker || "unknown";
-          const text = msg.content || msg.text || "";
-          const isUser = role === "user" || role === "caller";
-
-          // Label
-          pdf.setFont("helvetica", "bold");
-          pdf.setFontSize(7.5);
-          pdf.setTextColor(isUser ? 130 : 45, isUser ? 120 : 74, isUser ? 110 : 62);
-          pdf.text(isUser ? "CALLER" : "COUNSELLOR", margin + 2, y);
-          y += 5;
-
-          // Bubble
+        uniqueMemories.forEach((m) => {
           const lines = pdf
             .setFont("helvetica", "normal")
             .setFontSize(10)
-            .splitTextToSize(text, contentW - 14);
-
-          const blockH = lines.length * 5 + 7;
-          ensureSpace(blockH + 4);
-
-          pdf.setFillColor(isUser ? 250 : 240, isUser ? 248 : 247, isUser ? 245 : 245);
-          pdf.setDrawColor(isUser ? 230 : 200, isUser ? 225 : 220, isUser ? 220 : 210);
-          pdf.roundedRect(margin, y - 3, contentW, blockH, 2.5, 2.5, "FD");
-
+            .splitTextToSize(`• ${m.content}`, contentW - 10);
+          const blockH = lines.length * 5 + 2;
+          ensureSpace(blockH + 2);
           pdf.setTextColor(60, 55, 50);
-          pdf.text(lines, margin + 7, y + 3.5);
-          y += blockH + 5;
+          pdf.text(lines, margin + 6, y);
+          y += blockH + 1;
         });
+        y += 8;
+      }
 
-        if (docIdx < docs.length - 1) {
+      // ── Section 2: Caretaker Timeline ──
+      if (entries.length > 0) {
+        ensureSpace(20);
+        pdf.setFillColor(245, 243, 240);
+        pdf.roundedRect(margin, y - 3, contentW, 12, 3, 3, "F");
+        pdf.setFont("helvetica", "bold");
+        pdf.setFontSize(13);
+        pdf.setTextColor(45, 74, 62);
+        pdf.text("Caretaker Timeline", margin + 6, y + 5);
+        y += 16;
+
+        entries.forEach((entry, idx) => {
+          const md = getMeta(entry);
+          const entryType = (md.type || "note").toUpperCase();
+          const ts = getPrimaryISO(entry);
+          const timeStr = ts ? new Date(ts).toLocaleString() : "";
+
+          // Entry header line
+          ensureSpace(18);
+          pdf.setFont("helvetica", "bold");
+          pdf.setFontSize(10);
+          pdf.setTextColor(45, 74, 62);
+          pdf.text(`[${entryType}]`, margin + 6, y);
+          pdf.setFont("helvetica", "normal");
+          pdf.setFontSize(8);
+          pdf.setTextColor(140, 135, 130);
+          pdf.text(timeStr, W - margin, y, { align: "right" });
           y += 6;
-          ensureSpace(8);
-          pdf.setDrawColor(220, 215, 210);
-          pdf.setLineWidth(0.3);
-          pdf.line(margin + 30, y, W - margin - 30, y);
-          y += 10;
-        }
-      });
 
-      // Footer
+          // Entry content
+          const content = entry.content || "";
+          if (content) {
+            const lines = pdf
+              .setFont("helvetica", "normal")
+              .setFontSize(10)
+              .splitTextToSize(content, contentW - 12);
+            const blockH = lines.length * 5 + 7;
+            ensureSpace(blockH + 4);
+
+            pdf.setFillColor(250, 248, 245);
+            pdf.setDrawColor(230, 225, 220);
+            pdf.roundedRect(margin, y - 3, contentW, blockH, 2.5, 2.5, "FD");
+            pdf.setTextColor(60, 55, 50);
+            pdf.text(lines, margin + 7, y + 3.5);
+            y += blockH + 5;
+          }
+
+          if (idx < entries.length - 1) {
+            y += 4;
+          }
+        });
+      }
+
+      // ── Footer ──
       pdf.setFont("helvetica", "normal");
       pdf.setFontSize(7);
       pdf.setTextColor(160, 155, 150);
-      pdf.text("AI Counsellor  •  Confidential", W / 2, H - 10, { align: "center" });
+      pdf.text("Dementia Voice Agent  •  Confidential", W / 2, H - 10, { align: "center" });
 
-      pdf.save("conversation-transcripts.pdf");
+      pdf.save("patient-care-report.pdf");
     } catch (err) {
       console.error("Download failed:", err);
-      alert("Failed to download transcripts. Check console for details.");
+      alert("Failed to download report. Check console for details.");
     } finally {
       setDownloading(false);
     }
@@ -365,7 +400,7 @@ export default function CaretakerPortal() {
     setLoading(true);
     setError("");
     try {
-      const [t, a] = await Promise.all([getTimeline(), getAnalyticsSummary()]);
+      const [t, a, m] = await Promise.all([getTimeline(), getAnalyticsSummary(), getMemories()]);
       const msgs = (t.messages || []).slice().sort((m1, m2) => {
         const ts1 = new Date(getPrimaryISO(m1)).getTime() || 0;
         const ts2 = new Date(getPrimaryISO(m2)).getTime() || 0;
@@ -373,6 +408,7 @@ export default function CaretakerPortal() {
       });
       setTimeline(msgs);
       setSummary(a.summary);
+      setMemories(m.memories || []);
     } catch (e: any) {
       setError(e?.message || "Failed to load caretaker data");
     } finally {
@@ -675,7 +711,7 @@ export default function CaretakerPortal() {
             }}
           >
             <span style={{ display: "inline-block", minWidth: 175, textAlign: "center" }}>
-              {downloading ? "Downloading..." : "Download Transcripts"}
+              {downloading ? "Downloading..." : "Download Report"}
             </span>
           </button>
         </div>
@@ -686,6 +722,67 @@ export default function CaretakerPortal() {
           {error}
         </div>
       ) : null}
+
+      {/* Call Patient */}
+      <section className="form-card" style={{ animationDelay: "0.05s" }}>
+        <div className="card-header">
+          <SectionBadge>C</SectionBadge>
+          <div>
+            <h2 className="card-title">Call Patient</h2>
+            <p className="card-description">Initiate a voice call via LiveKit</p>
+          </div>
+        </div>
+
+        <div style={{ padding: 16 }}>
+          <div className="form-grid">
+            <div className="form-group">
+              <label className="form-label">Phone Number</label>
+              <input
+                className="form-input"
+                type="tel"
+                placeholder="+33 7 68 97 56 61"
+                value={callPhone}
+                onChange={(e) => setCallPhone(e.target.value)}
+              />
+            </div>
+          </div>
+
+          <div className="call-action-row" style={{ marginTop: 12 }}>
+            <button
+              type="button"
+              className={`btn btn-call ${callStatus}`}
+              onClick={handleCallPatient}
+              disabled={callStatus === "calling"}
+            >
+              {callStatus === "calling" ? (
+                <>
+                  <svg className="spinner" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="18" height="18">
+                    <path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83" />
+                  </svg>
+                  Calling...
+                </>
+              ) : callStatus === "success" ? (
+                <>
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="18" height="18">
+                    <path d="M20 6L9 17l-5-5" />
+                  </svg>
+                  Call Initiated
+                </>
+              ) : (
+                <>
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" width="18" height="18">
+                    <path d="M22 16.92v3a2 2 0 01-2.18 2 19.79 19.79 0 01-8.63-3.07 19.5 19.5 0 01-6-6 19.79 19.79 0 01-3.07-8.67A2 2 0 014.11 2h3a2 2 0 012 1.72c.127.96.361 1.903.7 2.81a2 2 0 01-.45 2.11L8.09 9.91a16 16 0 006 6l1.27-1.27a2 2 0 012.11-.45c.907.339 1.85.573 2.81.7A2 2 0 0122 16.92z" />
+                  </svg>
+                  Call Patient
+                </>
+              )}
+            </button>
+            {callStatus === "error" && callError && (
+              <span className="error-text">{callError}</span>
+            )}
+          </div>
+        </div>
+      </section>
 
       {/* Add Entry */}
       <section className="form-card" style={{ animationDelay: "0.1s" }}>
@@ -972,6 +1069,83 @@ export default function CaretakerPortal() {
 
       {analyticsCharts}
 
+      {/* Patient Memories */}
+      {memories.length > 0 && (
+        <section className="form-card" style={{ animationDelay: "0.25s" }}>
+          <div className="card-header">
+            <SectionBadge>M</SectionBadge>
+            <div style={{ flex: 1 }}>
+              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+                <h2 className="card-title">Patient Memories</h2>
+                <button
+                  type="button"
+                  onClick={async () => {
+                    try {
+                      const data = await getMemories();
+                      setMemories(data.memories || []);
+                    } catch (e) {
+                      console.error("Failed to refresh memories", e);
+                    }
+                  }}
+                  className="btn-outline"
+                  style={{
+                    padding: "6px 14px",
+                    fontSize: 13,
+                    cursor: "pointer",
+                    borderRadius: 6,
+                    border: "1px solid #ccc",
+                    background: "#fff",
+                    color: "#555",
+                  }}
+                >
+                  Refresh
+                </button>
+              </div>
+              <p className="card-description">
+                What the agent has learned across conversations ({memories.length})
+              </p>
+            </div>
+          </div>
+
+          <div style={{ padding: 16 }}>
+            <ul className="questions-list">
+              {memories
+                .filter((m) => {
+                  // Skip system-prompt-like memories (agent persona descriptions)
+                  const lower = m.content.toLowerCase();
+                  if (lower.startsWith("user is sarah") || lower.startsWith("user is megan")) return false;
+                  if (lower.startsWith("megan ") || lower.startsWith("megan's ")) return false;
+                  if (lower.startsWith("sarah ") || lower.startsWith("sarah's ")) return false;
+                  return true;
+                })
+                .sort((a, b) => {
+                  const ta = new Date(a.updated_at || a.created_at).getTime();
+                  const tb = new Date(b.updated_at || b.created_at).getTime();
+                  return tb - ta;
+                })
+                .map((m) => (
+                  <li key={m.id} className="question-item" style={{ alignItems: "flex-start" }}>
+                    <span
+                      className="question-number"
+                      style={{ lineHeight: "28px", background: "#E0F2FE", color: "#0369A1" }}
+                    >
+                      M
+                    </span>
+                    <div style={{ flex: 1 }}>
+                      <div style={{ marginBottom: 4 }}>{m.content}</div>
+                      <div style={{ fontSize: 11, opacity: 0.5 }}>
+                        {m.updated_at
+                          ? `Updated ${new Date(m.updated_at).toLocaleString()}`
+                          : `Created ${new Date(m.created_at).toLocaleString()}`}
+                      </div>
+                    </div>
+                  </li>
+                ))}
+            </ul>
+          </div>
+        </section>
+      )}
+
       {/* Timeline */}
       <section className="form-card" style={{ animationDelay: "0.3s" }}>
         <div className="card-header">
@@ -995,6 +1169,7 @@ export default function CaretakerPortal() {
                   <option value="incident">incident</option>
                   <option value="medication">medication</option>
                   <option value="profile">profile</option>
+                  <option value="call_session">call session</option>
                 </select>
                 <svg className="select-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
                   <path d="M6 9l6 6 6-6" />

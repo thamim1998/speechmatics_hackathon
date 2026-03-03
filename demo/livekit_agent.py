@@ -25,13 +25,43 @@ SPEECHMATICS_API_KEY = os.getenv("SPEECHMATICS_API_KEY")
 BACKBOARD_API_KEY = os.getenv("BACKBOARD_API_KEY")
 BACKBOARD_URL = "https://app.backboard.io/api"
 
+# Twilio WhatsApp (for CRITICAL alerts)
+TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
+TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
+TWILIO_WHATSAPP_FROM = os.getenv("TWILIO_WHATSAPP_FROM", "whatsapp:+14155238886")  # Twilio sandbox
+CARETAKER_PHONE = os.getenv("CARETAKER_PHONE")
+
 # LiveKit env vars are read automatically by the SDK:
 # LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET
 
 ASSISTANT_FILE = Path(__file__).parent / ".livekit_assistant_id"
 PATIENT_PROFILE_PATH = Path(__file__).parent / "patient_profile.md"
 
-SYSTEM_PROMPT = """You are Sarah, a warm, patient, and caring voice companion for a person living with dementia.
+
+def send_whatsapp_alert(message):
+    """Send a WhatsApp message to the caretaker via Twilio."""
+    if not all([TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, CARETAKER_PHONE]):
+        logger.warning("Twilio WhatsApp not configured — skipping alert")
+        return
+    try:
+        to = f"whatsapp:{CARETAKER_PHONE}"
+        resp = requests.post(
+            f"https://api.twilio.com/2010-04-01/Accounts/{TWILIO_ACCOUNT_SID}/Messages.json",
+            auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN),
+            data={
+                "From": TWILIO_WHATSAPP_FROM,
+                "To": to,
+                "Body": message,
+            },
+        )
+        if resp.ok:
+            logger.info(f"WhatsApp alert sent to {CARETAKER_PHONE}")
+        else:
+            logger.error(f"WhatsApp alert failed: {resp.status_code} {resp.text[:200]}")
+    except Exception as e:
+        logger.error(f"WhatsApp alert error: {e}")
+
+SYSTEM_PROMPT = """You are Megan, a warm, patient, and caring voice companion for a person living with dementia.
 
 PERSONALITY:
 - Warm, gentle, encouraging — like a trusted friend
@@ -172,6 +202,13 @@ class SessionTracker:
 
         if sentiment == "CRITICAL":
             print(f"\n  {C.BG_RED}{C.WHITE}{C.BOLD}  !! ALERT: Critical concern - notifying caretaker !!  {C.RESET}\n")
+            send_whatsapp_alert(
+                f"🚨 CRITICAL ALERT from Megan (Voice Agent)\n\n"
+                f"Patient said: \"{text[:200]}\"\n\n"
+                f"Sentiment: CRITICAL ({confidence:.0%} confidence)\n"
+                f"Time: {datetime.now().strftime('%H:%M:%S')}\n\n"
+                f"Please check on the patient immediately."
+            )
 
     def llm_start(self):
         self._llm_start = time.time()
@@ -189,14 +226,14 @@ class SessionTracker:
         sentiment, confidence = analyze_sentiment(text)
         badge = sentiment_badge(sentiment, confidence)
 
-        print(f"  {C.DIM}[{fmt_time(elapsed)}]{C.RESET} {C.MAGENTA}Sarah:{C.RESET} {text}")
+        print(f"  {C.DIM}[{fmt_time(elapsed)}]{C.RESET} {C.MAGENTA}Megan:{C.RESET} {text}")
         print(f"  {' ' * 9}{badge}")
         print(f"  {C.DIM}  LLM: {llm_total:.1f}s total, TTFB: {ttfb:.1f}s{C.RESET}")
 
         self.messages.append({
             "timestamp": datetime.now().isoformat(),
             "elapsed_s": round(elapsed, 1),
-            "speaker": "sarah",
+            "speaker": "megan",
             "text": text,
             "sentiment": sentiment,
             "confidence": round(confidence, 2),
@@ -283,7 +320,7 @@ class SessionTracker:
                 t = fmt_time(entry["elapsed_s"])
                 badge = sentiment_badge(entry["sentiment"], entry["confidence"])
                 speaker_color = C.CYAN if entry["speaker"] == "patient" else C.MAGENTA
-                speaker_label = "Patient" if entry["speaker"] == "patient" else "Sarah  "
+                speaker_label = "Patient" if entry["speaker"] == "patient" else "Megan  "
                 text_preview = entry["text"][:50] + ("..." if len(entry["text"]) > 50 else "")
                 print(f"  {C.DIM}[{t}]{C.RESET} {speaker_color}{speaker_label}{C.RESET} {badge}")
                 print(f"         {C.DIM}\"{text_preview}\"{C.RESET}")
@@ -321,9 +358,18 @@ class SessionTracker:
 def setup_backboard(force_reset=False):
     headers = {"X-API-Key": BACKBOARD_API_KEY}
 
+    # 1. Resolve assistant_id: env var → file → create new
+    env_assistant_id = os.getenv("BACKBOARD_ASSISTANT_ID")
+
+    if env_assistant_id and not force_reset:
+        logger.info(f"Using BACKBOARD_ASSISTANT_ID from env: {env_assistant_id}")
+        # Still write to file for backwards compat
+        ASSISTANT_FILE.write_text(env_assistant_id)
+        return env_assistant_id
+
     if ASSISTANT_FILE.exists() and not force_reset:
         assistant_id = ASSISTANT_FILE.read_text().strip()
-        logger.info(f"Loaded Backboard assistant: {assistant_id}")
+        logger.info(f"Loaded Backboard assistant from file: {assistant_id}")
         return assistant_id
 
     logger.info("Creating Backboard memory assistant...")
@@ -359,29 +405,60 @@ def setup_backboard(force_reset=False):
 
 
 async def save_summary_to_backboard(assistant_id, report, caretaker_summary):
-    """Save caretaker summary to Backboard so the agent remembers it next time."""
+    """Save caretaker summary to Backboard so the agent remembers it next time.
+    Uses shared BACKBOARD_THREAD_ID so caretaker portal can see call sessions."""
+    import json as _json
     headers = {"X-API-Key": BACKBOARD_API_KEY}
     async with aiohttp.ClientSession() as session:
-        # Create thread for this session's summary
-        async with session.post(
-            f"{BACKBOARD_URL}/assistants/{assistant_id}/threads",
-            headers=headers,
-        ) as resp:
-            data = await resp.json()
-            tid = data.get("thread_id") or data.get("id")
+        # Use shared thread if available, otherwise create one
+        tid = os.getenv("BACKBOARD_THREAD_ID")
+        if not tid:
+            async with session.post(
+                f"{BACKBOARD_URL}/assistants/{assistant_id}/threads",
+                headers=headers,
+            ) as resp:
+                data = await resp.json()
+                tid = data.get("thread_id") or data.get("id")
 
-        # Save the summary with memory extraction
+        # Build transcript for the message content
+        transcript_lines = []
+        for m in report.get("messages", []):
+            transcript_lines.append(
+                f"[{m['elapsed_s']:.0f}s] {m['speaker']}: {m['text']}"
+            )
+        transcript_text = "\n".join(transcript_lines)
+
+        # Save the summary with structured metadata
         summary_text = (
-            f"Session on {report['day']}, {report['date']} at {report['time']}. "
+            f"Call Session on {report['day']}, {report['date']} at {report['time']}.\n"
             f"Duration: {report['duration_s']:.0f}s. "
-            f"Overall sentiment: {report['overall_sentiment']}. "
-            f"Caretaker summary: {caretaker_summary}"
+            f"Overall sentiment: {report['overall_sentiment']}.\n\n"
+            f"Caretaker summary:\n{caretaker_summary}\n\n"
+            f"Transcript:\n{transcript_text}"
         )
+
+        metadata = _json.dumps({
+            "source": "agent",
+            "type": "call_session",
+            "custom_timestamp": report.get("messages", [{}])[0].get("timestamp", datetime.now().isoformat()) if report.get("messages") else datetime.now().isoformat(),
+            "data": {
+                "date": report["date"],
+                "time": report["time"],
+                "day": report["day"],
+                "duration_s": report["duration_s"],
+                "exchanges": report["exchanges"],
+                "overall_sentiment": report["overall_sentiment"],
+                "sentiment_counts": report["sentiment_counts"],
+                "avg_ttfb_s": report.get("avg_ttfb_s", 0),
+            },
+        })
+
         form = aiohttp.FormData()
         form.add_field("content", summary_text)
         form.add_field("memory", "Auto")
         form.add_field("send_to_llm", "false")
         form.add_field("stream", "false")
+        form.add_field("metadata", metadata)
         await session.post(
             f"{BACKBOARD_URL}/threads/{tid}/messages",
             data=form, headers=headers,
@@ -453,7 +530,7 @@ class CareAgent(Agent):
     async def on_enter(self):
         """Greet the patient when connected."""
         await self.session.generate_reply(
-            instructions="Greet the patient warmly by their first name (from the profile). Introduce yourself as Sarah and ask how they are doing today."
+            instructions="Greet the patient warmly by their first name (from the profile). Introduce yourself as Megan and ask how they are doing today."
         )
 
     async def on_user_turn_completed(self, turn_ctx, new_message):
@@ -470,7 +547,7 @@ from livekit.agents import AgentServer, cli
 server = AgentServer()
 
 
-@server.rtc_session(agent_name="dementia-care")
+@server.rtc_session()
 async def entrypoint(ctx):
     global bb_assistant_id, tracker
 
@@ -495,7 +572,7 @@ async def entrypoint(ctx):
             memory="auto",
         ),
         tts=speechmatics.TTS(
-            voice="sarah",
+            voice="megan",
             api_key=SPEECHMATICS_API_KEY,
         ),
         vad=silero.VAD.load(),

@@ -90,20 +90,6 @@ export default function caretakerRouter({ threadId, assistantId }) {
 
   const router = express.Router();
 
-  // Shared secret auth middleware
-  router.use((req, res, next) => {
-    const secret = req.header("X-CARETAKER-SECRET");
-    if (!process.env.CARETAKER_SECRET) {
-      return res
-        .status(500)
-        .json({ error: "CARETAKER_SECRET not configured on server" });
-    }
-    if (secret !== process.env.CARETAKER_SECRET) {
-      return res.status(401).json({ error: "Unauthorized" });
-    }
-    next();
-  });
-
   // Create store once (shared by all routes)
   const store = new CaretakerStore({
     apiKey: process.env.BACKBOARD_API_KEY,
@@ -161,6 +147,32 @@ export default function caretakerRouter({ threadId, assistantId }) {
       res.json({ ok: true, messages });
     } catch (err) {
       console.error("[caretaker/timeline] error:", err);
+      res.status(500).json({ error: err.message || "Internal error" });
+    }
+  });
+
+  // Call session transcripts (from Python agent post-call saves)
+  router.get("/transcripts", async (req, res) => {
+    try {
+      const messages = await store.getTimeline();
+      const sessions = messages.filter((m) => {
+        const md = m.metadata_ || {};
+        return md.type === "call_session";
+      });
+      res.json({ ok: true, transcripts: sessions });
+    } catch (err) {
+      console.error("[caretaker/transcripts] error:", err);
+      res.status(500).json({ error: err.message || "Internal error" });
+    }
+  });
+
+  // Patient memories (extracted by Backboard from conversations)
+  router.get("/memories", async (req, res) => {
+    try {
+      const data = await store.client.getAssistantMemories(assistantId);
+      res.json({ ok: true, memories: data.memories || [] });
+    } catch (err) {
+      console.error("[caretaker/memories] error:", err);
       res.status(500).json({ error: err.message || "Internal error" });
     }
   });

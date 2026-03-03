@@ -290,6 +290,20 @@ export class BackboardClient {
   }
 
   /**
+   * Get all memories extracted by Backboard for an assistant.
+   * Returns { memories: [{ id, content, metadata, created_at, updated_at }] }
+   */
+  async getAssistantMemories(assistantId) {
+    const res = await fetch(`${BASE_URL}/assistants/${assistantId}/memories`, {
+      method: "GET",
+      headers: this.authHeaders(),
+    });
+    const text = await res.text();
+    mustOk(res, text);
+    return JSON.parse(text);
+  }
+
+  /**
    * Upload a document to an assistant.
    * Use this for stable facts (care plan, routine, baseline meds).
    *

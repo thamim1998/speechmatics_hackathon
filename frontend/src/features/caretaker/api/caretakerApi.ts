@@ -8,8 +8,6 @@
 
 
 
-const SECRET = import.meta.env.VITE_CARETAKER_SECRET as string | undefined;
-
 /**
  * Generic request wrapper
  */
@@ -17,18 +15,8 @@ async function request<T>(
   path: string,
   options: RequestInit = {}
 ): Promise<T> {
-  if (!SECRET) {
-    throw new Error(
-      "VITE_CARETAKER_SECRET is missing. Add it to frontend/.env and restart Vite."
-    );
-  }
-
   const res = await fetch(path, {
     ...options,
-    headers: {
-      ...(options.headers || {}),
-      "X-CARETAKER-SECRET": SECRET,
-    },
   });
 
   if (!res.ok) {
@@ -143,4 +131,30 @@ export function getAnalyticsSummary() {
   return request<AnalyticsSummaryResponse>(
     "/api/caretaker/analytics/summary"
   );
+}
+
+export interface TranscriptsResponse {
+  ok: boolean;
+  transcripts: TimelineMessage[];
+}
+
+export function getTranscripts() {
+  return request<TranscriptsResponse>("/api/caretaker/transcripts");
+}
+
+export interface Memory {
+  id: string;
+  content: string;
+  metadata: Record<string, any>;
+  created_at: string;
+  updated_at: string | null;
+}
+
+export interface MemoriesResponse {
+  ok: boolean;
+  memories: Memory[];
+}
+
+export function getMemories() {
+  return request<MemoriesResponse>("/api/caretaker/memories");
 }
